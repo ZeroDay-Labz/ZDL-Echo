@@ -674,17 +674,18 @@ impl eframe::App for DtmfApp {
                 });
                 ui.separator();
 
-                // history + live runs; clone so it stays read-only but selectable/copyable
-                let mut display_text = self.display_log();
+                // read-only, selectable & copyable; scrolling up releases the
+                // auto-stick so you can highlight history while tones arrive.
+                let log = self.display_log();
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_sized(
-                            ui.available_size(),
-                            egui::TextEdit::multiline(&mut display_text)
-                                .frame(egui::Frame::none())
-                                .font(egui::TextStyle::Monospace)
-                                .text_color(GREEN),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(log).monospace().color(GREEN),
+                            )
+                                .selectable(true),
                         );
                     });
             });

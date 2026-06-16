@@ -1,4 +1,23 @@
 //! ZDL-Echo Core DSP Engine
+//!
+//! Tone detection that rejects speech and noise. The key idea is *coherence*:
+//! for a candidate frequency we measure what fraction of the block's total
+//! energy is aligned with that frequency (0..1). A real DTMF/MF tone puts a
+//! large share of energy into one or two narrow bins; speech spreads its energy
+//! broadly, so every bin's coherence stays low. We only accept a detection when
+//! the candidate tones genuinely dominate the block.
+
+// ---- tunables ----
+const SQUELCH: f32 = 1e-5;     // mean-power floor; below this the block is "silence"
+const TONE_MIN: f32 = 0.06;    // each tone must hold >= 6% of block energy
+const PAIR_MIN: f32 = 0.28;    // the two tones together must hold >= 28%
+const DOMINANCE: f32 = 1.8;    // winner must beat the runner-up in its group by this factor
+const MAX_TWIST_DB: f32 = 8.0; // allowed level difference between the two tones
+const SF_MIN: f32 = 0.45;      // 2600 must hold >= 45% (a pure tone is ~0.5)
+/// Detect the 2600 Hz single-frequency tone on RX. OFF by default — it is the
+/// biggest source of false hits on speech. Flip to `true` to re-enable it
+/// (with the strict SF_MIN gate above).
+const DETECT_SF: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToneType { Dtmf, Mf, Sf }
@@ -7,8 +26,6 @@ pub struct ToneDecoder {
     sample_rate: f32,
     block_size: usize,
     sample_buffer: Vec<f32>,
-    min_magnitude: f32,
-    max_twist_db: f32,
     drift_allowance: f32,
     last_detected: Option<(ToneType, char)>,
     consecutive_hits: u32,
@@ -21,16 +38,12 @@ impl ToneDecoder {
     pub fn new(sample_rate: f32) -> Self {
         Self {
             sample_rate,
-            block_size: (sample_rate * 0.020) as usize,
+            block_size: (sample_rate * 0.020) as usize, // 20 ms blocks
             sample_buffer: Vec::with_capacity((sample_rate * 0.020) as usize),
-            min_magnitude: 0.5,   // sensitive enough for quiet virtual cables
-            max_twist_db: 10.0,   // tolerate distortion from software cables
             drift_allowance: 0.015,
             last_detected: None,
             consecutive_hits: 0,
-            required_hits: 2,     // confirm over 2 blocks (~40ms) to reject noise.
-            // Drop to 1 for instant response now that the
-            // emit logic below is fixed.
+            required_hits: 2, // confirm over ~40 ms so transient speech can't fake a tone
             silence_count: 0,
             required_silence: 1,
         }
@@ -53,11 +66,6 @@ impl ToneDecoder {
                         self.consecutive_hits = 1;
                     }
 
-                    // EMIT EXACTLY ONCE, when we hit the confirm count. This MUST
-                    // live outside the if/else above — when it was nested in the
-                    // "same as last" branch, a fresh tone set hits=1 in the else
-                    // branch and the check never ran, so required_hits=1 emitted
-                    // nothing, ever.
                     if self.consecutive_hits == self.required_hits {
                         detected_events.push((tone_type, ch));
                     }
@@ -75,86 +83,152 @@ impl ToneDecoder {
     }
 
     fn analyze_block(&self) -> Option<(ToneType, char)> {
-        let total_energy: f32 = self.sample_buffer.iter().map(|&x| x * x).sum();
-        let avg_energy = total_energy / (self.block_size as f32);
-        if avg_energy < 0.000001 { return None; } // squelch
-
-        let sf_mag = self.goertzel_with_drift(2600.0);
-        if sf_mag > self.min_magnitude && sf_mag > avg_energy * 10.0 {
-            return Some((ToneType::Sf, '⌁'));
+        let n = self.block_size as f32;
+        let energy: f32 = self.sample_buffer.iter().map(|&x| x * x).sum();
+        if energy / n < SQUELCH {
+            return None; // silence — also avoids divide-by-tiny in coherence
         }
 
-        let dtmf_rows = [697.0, 770.0, 852.0, 941.0];
-        let dtmf_cols = [1209.0, 1336.0, 1477.0, 1633.0];
-        let dtmf_matrix = [['1', '2', '3', 'A'],['4', '5', '6', 'B'],['7', '8', '9', 'C'],['*', '0', '#', 'D']];
+        // fraction of block energy aligned with frequency f, clamped to [0,1]
+        let coh = |f: f32| -> f32 {
+            let m = self.goertzel_with_drift(f);
+            let c = (m * m) / (n * energy);
+            if c.is_finite() { c.min(1.0) } else { 0.0 }
+        };
 
-        let row_mags: Vec<f32> = dtmf_rows.iter().map(|&f| self.goertzel_with_drift(f)).collect();
-        let col_mags: Vec<f32> = dtmf_cols.iter().map(|&f| self.goertzel_with_drift(f)).collect();
+        // ---- DTMF: one row tone + one column tone ----
+        let rows = [697.0, 770.0, 852.0, 941.0];
+        let cols = [1209.0, 1336.0, 1477.0, 1633.0];
+        let matrix = [
+            ['1', '2', '3', 'A'],
+            ['4', '5', '6', 'B'],
+            ['7', '8', '9', 'C'],
+            ['*', '0', '#', 'D'],
+        ];
+        let rc: Vec<f32> = rows.iter().map(|&f| coh(f)).collect();
+        let cc: Vec<f32> = cols.iter().map(|&f| coh(f)).collect();
+        if let (Some((ri, rv)), Some((ci, cv))) = (top1(&rc), top1(&cc)) {
+            let row_ok = rv > TONE_MIN && rv >= DOMINANCE * second(&rc);
+            let col_ok = cv > TONE_MIN && cv >= DOMINANCE * second(&cc);
+            if row_ok && col_ok && rv + cv > PAIR_MIN && twist_ok(rv, cv) {
+                return Some((ToneType::Dtmf, matrix[ri][ci]));
+            }
+        }
 
-        if let (Some(r_idx), Some(c_idx)) = (find_strongest(&row_mags), find_strongest(&col_mags)) {
-            if row_mags[r_idx] > self.min_magnitude && col_mags[c_idx] > self.min_magnitude {
-                if self.validate_twist(row_mags[r_idx], col_mags[c_idx]) {
-                    return Some((ToneType::Dtmf, dtmf_matrix[r_idx][c_idx]));
+        // ---- MF: two of six tones ----
+        let mf = [700.0, 900.0, 1100.0, 1300.0, 1500.0, 1700.0];
+        let mc: Vec<f32> = mf.iter().map(|&f| coh(f)).collect();
+        if let Some((i1, v1, i2, v2)) = top2(&mc) {
+            let dom = v1 > TONE_MIN && v2 > TONE_MIN && v2 >= DOMINANCE * third(&mc, i1, i2);
+            if dom && v1 + v2 > PAIR_MIN && twist_ok(v1, v2) {
+                if let Some(ch) = decode_mf(mf[i1], mf[i2]) {
+                    return Some((ToneType::Mf, ch));
                 }
             }
         }
 
-        let mf_freqs = [700.0, 900.0, 1100.0, 1300.0, 1500.0, 1700.0];
-        let mf_mags: Vec<f32> = mf_freqs.iter().map(|&f| self.goertzel_with_drift(f)).collect();
-
-        if let Some((idx1, idx2)) = find_top_two(&mf_mags) {
-            if mf_mags[idx1] > self.min_magnitude && mf_mags[idx2] > self.min_magnitude {
-                if self.validate_twist(mf_mags[idx1], mf_mags[idx2]) {
-                    if let Some(mf_char) = decode_mf(mf_freqs[idx1], mf_freqs[idx2]) {
-                        return Some((ToneType::Mf, mf_char));
-                    }
-                }
+        // ---- SF: single 2600 Hz tone ----
+        if DETECT_SF {
+            if coh(2600.0) > SF_MIN {
+                return Some((ToneType::Sf, '⌁'));
             }
         }
+
         None
     }
 
     fn goertzel_with_drift(&self, target_freq: f32) -> f32 {
-        let lower_bound = target_freq * (1.0 - self.drift_allowance);
-        let upper_bound = target_freq * (1.0 + self.drift_allowance);
-        let mag_center = self.goertzel(target_freq);
-        let mag_lower = self.goertzel(lower_bound);
-        let mag_upper = self.goertzel(upper_bound);
-        mag_center.max(mag_lower).max(mag_upper)
+        let lower = target_freq * (1.0 - self.drift_allowance);
+        let upper = target_freq * (1.0 + self.drift_allowance);
+        self.goertzel(target_freq)
+            .max(self.goertzel(lower))
+            .max(self.goertzel(upper))
     }
 
     fn goertzel(&self, target_freq: f32) -> f32 {
         let n = self.block_size as f32;
         let k = (n * target_freq / self.sample_rate).round();
         let omega = (2.0 * std::f32::consts::PI * k) / n;
-        let cosine = omega.cos();
-        let coeff = 2.0 * cosine;
-        let mut q1 = 0.0; let mut q2 = 0.0;
-
+        let coeff = 2.0 * omega.cos();
+        let mut q1 = 0.0;
+        let mut q2 = 0.0;
         for &sample in &self.sample_buffer {
             let q0 = coeff * q1 - q2 + sample;
-            q2 = q1; q1 = q0;
+            q2 = q1;
+            q1 = q0;
         }
-        let magnitude_sq = (q1 * q1) + (q2 * q2) - (q1 * q2 * coeff);
-        if magnitude_sq > 0.0 { magnitude_sq.sqrt() } else { 0.0 }
-    }
-
-    fn validate_twist(&self, mag1: f32, mag2: f32) -> bool {
-        let ratio = if mag1 > mag2 { mag1 / mag2 } else { mag2 / mag1 };
-        let twist_db = 20.0 * ratio.log10();
-        twist_db <= self.max_twist_db
+        let mag_sq = (q1 * q1) + (q2 * q2) - (q1 * q2 * coeff);
+        if mag_sq > 0.0 { mag_sq.sqrt() } else { 0.0 }
     }
 }
 
-fn find_strongest(mags: &[f32]) -> Option<usize> {
-    mags.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)).map(|(idx, _)| idx)
+fn top1(v: &[f32]) -> Option<(usize, f32)> {
+    v.iter()
+        .enumerate()
+        .fold(None, |acc, (i, &x)| match acc {
+            Some((_, best)) if best >= x => acc,
+            _ => Some((i, x)),
+        })
 }
 
-fn find_top_two(mags: &[f32]) -> Option<(usize, usize)> {
-    if mags.len() < 2 { return None; }
-    let mut indices: Vec<usize> = (0..mags.len()).collect();
-    indices.sort_by(|&a, &b| mags[b].partial_cmp(&mags[a]).unwrap_or(std::cmp::Ordering::Equal));
-    Some((indices[0], indices[1]))
+/// Second-largest value in the slice (0.0 if fewer than two entries).
+fn second(v: &[f32]) -> f32 {
+    let mut max = f32::MIN;
+    let mut sec = f32::MIN;
+    for &x in v {
+        if x > max {
+            sec = max;
+            max = x;
+        } else if x > sec {
+            sec = x;
+        }
+    }
+    if sec == f32::MIN { 0.0 } else { sec.max(0.0) }
+}
+
+/// Indices/values of the two largest entries, v1 >= v2.
+fn top2(v: &[f32]) -> Option<(usize, f32, usize, f32)> {
+    if v.len() < 2 {
+        return None;
+    }
+    let mut i1 = 0;
+    let mut v1 = f32::MIN;
+    let mut i2 = 0;
+    let mut v2 = f32::MIN;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v1 {
+            i2 = i1;
+            v2 = v1;
+            i1 = i;
+            v1 = x;
+        } else if x > v2 {
+            i2 = i;
+            v2 = x;
+        }
+    }
+    Some((i1, v1.max(0.0), i2, v2.max(0.0)))
+}
+
+/// Largest value excluding two indices.
+fn third(v: &[f32], skip1: usize, skip2: usize) -> f32 {
+    let mut m = 0.0f32;
+    for (i, &x) in v.iter().enumerate() {
+        if i == skip1 || i == skip2 {
+            continue;
+        }
+        if x > m {
+            m = x;
+        }
+    }
+    m
+}
+
+fn twist_ok(a: f32, b: f32) -> bool {
+    if a <= 0.0 || b <= 0.0 {
+        return false;
+    }
+    let ratio = if a > b { a / b } else { b / a };
+    20.0 * ratio.log10() <= MAX_TWIST_DB
 }
 
 fn decode_mf(f1: f32, f2: f32) -> Option<char> {
