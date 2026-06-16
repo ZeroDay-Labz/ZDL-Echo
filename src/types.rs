@@ -13,6 +13,7 @@ pub enum AppMessage {
 
     // System & hardware commands
     SetInputDevice(String),
+    SetOutputDevice(String),
     AudioStatus(String),
     AudioError(String),
 }

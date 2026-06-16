@@ -48,6 +48,8 @@ pub struct DtmfApp {
 
     input_devices: Vec<String>,
     selected_input: String,
+    output_devices: Vec<String>,
+    selected_output: String,
     rx_level: f32,
 
     dial_input: String,
@@ -75,6 +77,19 @@ impl DtmfApp {
             .map(|d| d.to_string())
             .unwrap_or_default();
 
+        let mut out_devs = Vec::new();
+        if let Ok(devices) = host.output_devices() {
+            for d in devices {
+                out_devs.push(d.to_string());
+            }
+        }
+        out_devs.dedup();
+
+        let default_out = host
+            .default_output_device()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+
         Self {
             tx,
             rx,
@@ -89,6 +104,8 @@ impl DtmfApp {
             show_routing: false,
             input_devices: in_devs,
             selected_input: default_in,
+            output_devices: out_devs,
+            selected_output: default_out,
             rx_level: 0.0,
             dial_input: String::new(),
             dial_queue: VecDeque::new(),
@@ -431,14 +448,20 @@ impl eframe::App for DtmfApp {
                     // RX signal presence
                     ui.label(egui::RichText::new("RX SIGNAL").color(AMBER_DIM).size(11.0));
                     self.draw_level_meter(ui, 16.0);
-                    let src = if self.selected_input.is_empty() {
-                        "— no source —".to_string()
+                    let src_in = if self.selected_input.is_empty() {
+                        "in:  — none —".to_string()
                     } else {
-                        self.selected_input.clone()
+                        format!("in:  {}", self.selected_input)
                     };
-                    ui.label(egui::RichText::new(src).color(DIM).size(10.0));
+                    let src_out = if self.selected_output.is_empty() {
+                        "out: — none —".to_string()
+                    } else {
+                        format!("out: {}", self.selected_output)
+                    };
+                    ui.label(egui::RichText::new(src_in).color(DIM).size(10.0));
+                    ui.label(egui::RichText::new(src_out).color(DIM).size(10.0));
                     ui.label(
-                        egui::RichText::new("source > ROUTING menu")
+                        egui::RichText::new("routing > ROUTING menu")
                             .color(AMBER_DIM)
                             .size(9.0),
                     );
@@ -704,6 +727,43 @@ impl eframe::App for DtmfApp {
                 .show(&ctx, |ui| {
                     ui.set_max_width(380.0);
 
+                    // ---- TX OUTPUT (where transmitted tones are sent) ----
+                    ui.label(egui::RichText::new("TX OUTPUT").color(AMBER).strong());
+                    ui.label(egui::RichText::new("ACTIVE:").color(AMBER_DIM).size(10.0));
+                    let active_out = if self.selected_output.is_empty() {
+                        "— none —".to_string()
+                    } else {
+                        self.selected_output.clone()
+                    };
+                    ui.label(egui::RichText::new(active_out).color(GREEN));
+
+                    ui.label(egui::RichText::new("ENDPOINTS (click to route TX)").color(AMBER_DIM).size(10.0));
+                    let cur_out = self.selected_output.clone();
+                    let mut out_clicked: Option<String> = None;
+                    ui.push_id("tx_out_list", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                for dev in &self.output_devices {
+                                    let sel = *dev == cur_out;
+                                    let color = if sel { AMBER } else { GREEN };
+                                    if ui
+                                        .selectable_label(sel, egui::RichText::new(dev).color(color))
+                                        .clicked()
+                                    {
+                                        out_clicked = Some(dev.clone());
+                                    }
+                                }
+                            });
+                    });
+                    if let Some(d) = out_clicked {
+                        self.selected_output = d.clone();
+                        let _ = self.tx.send(AppMessage::SetOutputDevice(d));
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
                     ui.label(egui::RichText::new("RX CAPTURE SOURCE").color(AMBER).strong());
                     ui.label(
                         egui::RichText::new("live input level")
@@ -727,20 +787,22 @@ impl eframe::App for DtmfApp {
 
                     let current = self.selected_input.clone();
                     let mut clicked: Option<String> = None;
-                    egui::ScrollArea::vertical()
-                        .max_height(240.0)
-                        .show(ui, |ui| {
-                            for dev in &self.input_devices {
-                                let sel = *dev == current;
-                                let color = if sel { AMBER } else { GREEN };
-                                if ui
-                                    .selectable_label(sel, egui::RichText::new(dev).color(color))
-                                    .clicked()
-                                {
-                                    clicked = Some(dev.clone());
+                    ui.push_id("rx_in_list", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                for dev in &self.input_devices {
+                                    let sel = *dev == current;
+                                    let color = if sel { AMBER } else { GREEN };
+                                    if ui
+                                        .selectable_label(sel, egui::RichText::new(dev).color(color))
+                                        .clicked()
+                                    {
+                                        clicked = Some(dev.clone());
+                                    }
                                 }
-                            }
-                        });
+                            });
+                    });
                     if let Some(d) = clicked {
                         self.selected_input = d.clone();
                         let _ = self.tx.send(AppMessage::SetInputDevice(d));

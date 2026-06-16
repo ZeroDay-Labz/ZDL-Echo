@@ -1,7 +1,9 @@
-//! ZDL-Echo audio engine — TX Transmitter & RX Capture Engine.
-
-#![allow(unused_assignments)]
-#![allow(unused_variables)]
+//! ZDL-Echo audio engine — TX transmitter & RX capture.
+//!
+//! Both the output (transmit) and input (capture) devices are selectable and
+//! rebuilt on command. Every device/stream call is fallible: on failure we send
+//! an AudioError to the UI and keep the engine alive instead of panicking, and
+//! we convert i16/u16 hardware formats to/from f32 so non-float devices work.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender};
@@ -9,126 +11,306 @@ use std::sync::{Arc, Mutex};
 use crate::types::AppMessage;
 use crate::decoder::ToneDecoder;
 
+const PI: f32 = std::f32::consts::PI;
+
 struct TxOscillator {
-    phase_1: f32, phase_2: f32,
-    freq_1: f32, freq_2: f32,
+    phase_1: f32,
+    phase_2: f32,
+    freq_1: f32,
+    freq_2: f32,
     sample_rate: f32,
     frames_remaining: usize,
+}
+
+impl TxOscillator {
+    /// Next mono sample in [-1, 1]. 0.0 when nothing is playing.
+    fn next_sample(&mut self) -> f32 {
+        if self.frames_remaining == 0 {
+            return 0.0;
+        }
+        self.frames_remaining -= 1;
+        let s1 = (self.phase_1 * 2.0 * PI).sin();
+        self.phase_1 = (self.phase_1 + self.freq_1 / self.sample_rate) % 1.0;
+        if self.freq_2 > 0.0 {
+            let s2 = (self.phase_2 * 2.0 * PI).sin();
+            self.phase_2 = (self.phase_2 + self.freq_2 / self.sample_rate) % 1.0;
+            (s1 + s2) * 0.25
+        } else {
+            s1 * 0.4
+        }
+    }
+}
+
+fn find_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.output_devices().ok()?.find(|d| d.to_string() == name)
+}
+fn find_input_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.input_devices().ok()?.find(|d| d.to_string() == name)
+}
+
+/// Downmix interleaved frames of `T` to mono f32 via `conv`.
+fn downmix<T: Copy>(data: &[T], channels: usize, conv: impl Fn(T) -> f32) -> Vec<f32> {
+    let ch = channels.max(1);
+    data.chunks(ch)
+        .map(|frame| frame.iter().map(|&s| conv(s)).sum::<f32>() / ch as f32)
+        .collect()
+}
+
+fn emit(decoder: &mut ToneDecoder, mono: &[f32], tx: &Sender<AppMessage>) {
+    let peak = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    let _ = tx.send(AppMessage::RxLevel(peak));
+    for (_, ch) in decoder.process_samples(mono) {
+        let _ = tx.send(AppMessage::DetectedTone(ch));
+    }
+}
+
+/// Build + start an output stream on `device`, in whatever format it supports.
+fn build_output(
+    device: &cpal::Device,
+    tx_state: &Arc<Mutex<TxOscillator>>,
+    tx_ui: &Sender<AppMessage>,
+) -> Result<cpal::Stream, String> {
+    let supported = device
+        .default_output_config()
+        .map_err(|e| format!("output config: {e}"))?;
+    let fmt = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let sr = config.sample_rate as f32;
+    let channels = (config.channels as usize).max(1);
+
+    // keep the oscillator's clock matched to this device
+    if let Ok(mut s) = tx_state.lock() {
+        s.sample_rate = sr;
+    }
+
+    let err_tx = tx_ui.clone();
+    let on_err = move |e| {
+        let _ = err_tx.send(AppMessage::AudioError(format!("TX stream: {e}")));
+    };
+
+    let stream = match fmt {
+        cpal::SampleFormat::F32 => {
+            let st = Arc::clone(tx_state);
+            device.build_output_stream(
+                config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let mut o = st.lock().unwrap();
+                    for frame in data.chunks_mut(channels) {
+                        let v = o.next_sample();
+                        for ch in frame.iter_mut() {
+                            *ch = v;
+                        }
+                    }
+                },
+                on_err,
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let st = Arc::clone(tx_state);
+            device.build_output_stream(
+                config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let mut o = st.lock().unwrap();
+                    for frame in data.chunks_mut(channels) {
+                        let v = (o.next_sample().clamp(-1.0, 1.0) * 32767.0) as i16;
+                        for ch in frame.iter_mut() {
+                            *ch = v;
+                        }
+                    }
+                },
+                on_err,
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let st = Arc::clone(tx_state);
+            device.build_output_stream(
+                config,
+                move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                    let mut o = st.lock().unwrap();
+                    for frame in data.chunks_mut(channels) {
+                        let f = o.next_sample().clamp(-1.0, 1.0);
+                        let v = ((f * 0.5 + 0.5) * 65535.0) as u16;
+                        for ch in frame.iter_mut() {
+                            *ch = v;
+                        }
+                    }
+                },
+                on_err,
+                None,
+            )
+        }
+        other => return Err(format!("unsupported output format: {other:?}")),
+    }
+        .map_err(|e| format!("output build: {e}"))?;
+
+    stream.play().map_err(|e| format!("output play: {e}"))?;
+    Ok(stream)
+}
+
+/// Build + start an input stream on `device`, feeding the decoder.
+fn build_input(
+    device: &cpal::Device,
+    tx_ui: &Sender<AppMessage>,
+) -> Result<cpal::Stream, String> {
+    let supported = device
+        .default_input_config()
+        .map_err(|e| format!("input config: {e}"))?;
+    let fmt = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let sr = config.sample_rate as f32;
+    let channels = (config.channels as usize).max(1);
+
+    let err_tx = tx_ui.clone();
+    let on_err = move |e| {
+        let _ = err_tx.send(AppMessage::AudioError(format!("RX stream: {e}")));
+    };
+
+    let stream = match fmt {
+        cpal::SampleFormat::F32 => {
+            let mut decoder = ToneDecoder::new(sr);
+            let tx = tx_ui.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mono = downmix(data, channels, |s| s);
+                    emit(&mut decoder, &mono, &tx);
+                },
+                on_err,
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let mut decoder = ToneDecoder::new(sr);
+            let tx = tx_ui.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let mono = downmix(data, channels, |s| s as f32 / 32768.0);
+                    emit(&mut decoder, &mono, &tx);
+                },
+                on_err,
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let mut decoder = ToneDecoder::new(sr);
+            let tx = tx_ui.clone();
+            device.build_input_stream(
+                config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let mono = downmix(data, channels, |s| (s as f32 - 32768.0) / 32768.0);
+                    emit(&mut decoder, &mono, &tx);
+                },
+                on_err,
+                None,
+            )
+        }
+        other => return Err(format!("unsupported input format: {other:?}")),
+    }
+        .map_err(|e| format!("input build: {e}"))?;
+
+    stream.play().map_err(|e| format!("input play: {e}"))?;
+    Ok(stream)
 }
 
 pub fn run_audio_engine(tx_ui: Sender<AppMessage>, rx_audio: Receiver<AppMessage>) {
     let host = cpal::default_host();
 
-    // --- TX PIPELINE ---
-    let output_device = match host.default_output_device() {
-        Some(d) => d,
+    let tx_state = Arc::new(Mutex::new(TxOscillator {
+        phase_1: 0.0,
+        phase_2: 0.0,
+        freq_1: 0.0,
+        freq_2: 0.0,
+        sample_rate: 48_000.0,
+        frames_remaining: 0,
+    }));
+
+    // ---- initial streams on the default devices ----
+    let mut output_stream: Option<cpal::Stream> = match host.default_output_device() {
+        Some(dev) => match build_output(&dev, &tx_state, &tx_ui) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let _ = tx_ui.send(AppMessage::AudioError(e));
+                None
+            }
+        },
         None => {
-            let _ = tx_ui.send(AppMessage::AudioError("no audio output device".into()));
-            return;
+            let _ = tx_ui.send(AppMessage::AudioError("no output device".into()));
+            None
         }
     };
 
-    let output_config: cpal::StreamConfig = output_device.default_output_config().unwrap().into();
-    let sample_rate_out = output_config.sample_rate as f32;
-    let out_channels = output_config.channels as usize;
-
-    let tx_state = Arc::new(Mutex::new(TxOscillator {
-        phase_1: 0.0, phase_2: 0.0, freq_1: 0.0, freq_2: 0.0,
-        sample_rate: sample_rate_out, frames_remaining: 0,
-    }));
-
-    let tx_state_cb = Arc::clone(&tx_state);
-    let tx_out_err = tx_ui.clone();
-
-    let output_stream = output_device.build_output_stream(
-        output_config,
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let mut state = tx_state_cb.lock().unwrap();
-            for frame in data.chunks_mut(out_channels) {
-                let sample = if state.frames_remaining > 0 {
-                    state.frames_remaining -= 1;
-                    let s1 = (state.phase_1 * 2.0 * std::f32::consts::PI).sin();
-                    state.phase_1 = (state.phase_1 + state.freq_1 / state.sample_rate) % 1.0;
-                    if state.freq_2 > 0.0 {
-                        let s2 = (state.phase_2 * 2.0 * std::f32::consts::PI).sin();
-                        state.phase_2 = (state.phase_2 + state.freq_2 / state.sample_rate) % 1.0;
-                        (s1 + s2) * 0.25
-                    } else { s1 * 0.4 }
-                } else { 0.0 };
-                for channel_sample in frame.iter_mut() { *channel_sample = sample; }
+    let mut input_stream: Option<cpal::Stream> = match host.default_input_device() {
+        Some(dev) => match build_input(&dev, &tx_ui) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let _ = tx_ui.send(AppMessage::AudioError(e));
+                None
             }
         },
-        move |err| { let _ = tx_out_err.send(AppMessage::AudioError(format!("TX error: {err}"))); },
-        None,
-    ).unwrap();
-    output_stream.play().unwrap();
+        None => None,
+    };
 
-    // --- RX PIPELINE ---
-    let mut _active_input_stream: Option<cpal::Stream> = None;
-
-    macro_rules! build_input {
-        ($device:expr) => {{
-            let config: cpal::StreamConfig = $device.default_input_config().unwrap().into();
-            let sample_rate = config.sample_rate as f32;
-            let channels = config.channels as usize;
-            let mut decoder = ToneDecoder::new(sample_rate);
-            let tx_in_data = tx_ui.clone();
-            let tx_in_err = tx_ui.clone();
-
-            let stream = $device.build_input_stream(
-                config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let ch = channels.max(1);
-                    let mono: Vec<f32> =
-                        data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect();
-
-                    // Report input level so the UI meter proves audio is arriving.
-                    let peak = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-                    let _ = tx_in_data.send(AppMessage::RxLevel(peak));
-
-                    for (_, ch) in decoder.process_samples(&mono) {
-                        let _ = tx_in_data.send(AppMessage::DetectedTone(ch));
-                    }
-                },
-                move |err| { let _ = tx_in_err.send(AppMessage::AudioError(format!("RX err: {err}"))); },
-                None
-            ).unwrap();
-            stream.play().unwrap();
-            stream
-        }}
-    }
-
-    if let Some(in_dev) = host.default_input_device() {
-        _active_input_stream = Some(build_input!(in_dev));
-    }
-
-    // --- COMMAND LOOP ---
+    // ---- command loop ----
     while let Ok(msg) = rx_audio.recv() {
         match msg {
-            AppMessage::SetInputDevice(name) => {
-                _active_input_stream = None;
-                let mut found = false;
-                if let Ok(devices) = host.input_devices() {
-                    for dev in devices {
-                        // cpal 0.18.1: Device implements Display, so to_string() is the name.
-                        if dev.to_string() == name {
-                            _active_input_stream = Some(build_input!(dev));
-                            let _ = tx_ui.send(AppMessage::AudioStatus(format!("Hooked to: {}", name)));
-                            found = true;
-                            break;
+            AppMessage::SetOutputDevice(name) => {
+                output_stream = None; // drop the old stream first
+                match find_output_device(&host, &name) {
+                    Some(dev) => match build_output(&dev, &tx_state, &tx_ui) {
+                        Ok(s) => {
+                            output_stream = Some(s);
+                            let _ = tx_ui.send(AppMessage::AudioStatus(format!("TX -> {name}")));
                         }
+                        Err(e) => {
+                            let _ = tx_ui.send(AppMessage::AudioError(e));
+                        }
+                    },
+                    None => {
+                        let _ = tx_ui
+                            .send(AppMessage::AudioError(format!("TX device not found: {name}")));
                     }
                 }
-                if !found { let _ = tx_ui.send(AppMessage::AudioError(format!("Failed to hook: {}", name))); }
+            }
+            AppMessage::SetInputDevice(name) => {
+                input_stream = None;
+                match find_input_device(&host, &name) {
+                    Some(dev) => match build_input(&dev, &tx_ui) {
+                        Ok(s) => {
+                            input_stream = Some(s);
+                            let _ = tx_ui.send(AppMessage::AudioStatus(format!("RX <- {name}")));
+                        }
+                        Err(e) => {
+                            let _ = tx_ui.send(AppMessage::AudioError(e));
+                        }
+                    },
+                    None => {
+                        let _ = tx_ui
+                            .send(AppMessage::AudioError(format!("RX device not found: {name}")));
+                    }
+                }
             }
             AppMessage::PlayTone { f1, f2, ms } => {
-                let mut state = tx_state.lock().unwrap();
-                state.phase_1 = 0.0; state.phase_2 = 0.0;
-                state.freq_1 = f1; state.freq_2 = f2;
-                state.frames_remaining = (state.sample_rate * (ms as f32 / 1000.0)) as usize;
+                if let Ok(mut s) = tx_state.lock() {
+                    s.phase_1 = 0.0;
+                    s.phase_2 = 0.0;
+                    s.freq_1 = f1;
+                    s.freq_2 = f2;
+                    s.frames_remaining = (s.sample_rate * (ms as f32 / 1000.0)) as usize;
+                }
             }
-            AppMessage::StopAllTones => { tx_state.lock().unwrap().frames_remaining = 0; }
+            AppMessage::StopAllTones => {
+                if let Ok(mut s) = tx_state.lock() {
+                    s.frames_remaining = 0;
+                }
+            }
             _ => {}
         }
     }
+
+    // hold streams alive until the command channel closes
+    drop(output_stream);
+    drop(input_stream);
 }
