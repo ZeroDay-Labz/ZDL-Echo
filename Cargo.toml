@@ -1,0 +1,25 @@
+[package]
+name = "ZDL-Echo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.34.3"
+crossbeam-channel = "0.5.15"
+egui = "0.34.3"
+cpal = "0.18.1"
+
+
+[profile.dev]
+debug = 0 # Skips generating the massive .pdb file on Windows
+
+[profile.dev.package."*"]
+opt-level = 3
+
+
+[profile.release]
+opt-level = 3          # Maximum CPU optimization for the DSP math
+lto = true             # Link Time Optimization (drastically reduces .exe size and boosts speed)
+codegen-units = 1      # Forces the compiler to view the whole program at once to optimize better
+panic = "abort"        # Removes crash-unwinding code to save RAM and binary size
+strip = true           # Strips all debugging symbols from the final Windows binary
