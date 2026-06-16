@@ -24,6 +24,8 @@ const AMBER_DIM: egui::Color32 = egui::Color32::from_rgb(150, 100, 0);
 const AMBER_SEL: egui::Color32 = egui::Color32::from_rgb(74, 52, 0); // selection bg — text stays readable
 
 const DIAL_GAP_MS: u64 = 70;
+/// Silence (seconds) that ends a captured/transmitted run and starts a new line.
+const LINE_GAP_SECS: f32 = 3.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -34,7 +36,11 @@ enum Mode {
 pub struct DtmfApp {
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
-    log_text: String,
+    committed: String,        // finished lines (history)
+    pend_tx: String,          // current TX run, not yet committed
+    pend_rx: String,          // current RX run, not yet committed
+    pend_tx_at: Option<Instant>,
+    pend_rx_at: Option<Instant>,
     mode: Mode,
     tone_ms: u32,
     show_about: bool,
@@ -51,9 +57,6 @@ pub struct DtmfApp {
 
     current_f1: f32,
     current_f2: f32,
-
-    last_activity_time: Option<Instant>,
-    last_was_rx: Option<bool>,
 }
 
 impl DtmfApp {
@@ -75,7 +78,11 @@ impl DtmfApp {
         Self {
             tx,
             rx,
-            log_text: String::from("ZDL-ECHO // TONE TRANSMITTER\nready.\n"),
+            committed: String::from("ZDL-ECHO // TONE TRANSMITTER\nready.\n"),
+            pend_tx: String::new(),
+            pend_rx: String::new(),
+            pend_tx_at: None,
+            pend_rx_at: None,
             mode: Mode::Dtmf,
             tone_ms: 120,
             show_about: false,
@@ -89,38 +96,99 @@ impl DtmfApp {
             tx_until: None,
             current_f1: 0.0,
             current_f2: 0.0,
-            last_activity_time: None,
-            last_was_rx: None,
         }
     }
 
-    fn append_to_log(&mut self, text: &str, is_rx: bool) {
+    /// Add a tone fragment to the live run for its source. Consecutive tones
+    /// accumulate on one line until LINE_GAP_SECS of silence commits them.
+    fn push_tone(&mut self, frag: &str, is_rx: bool) {
         let now = Instant::now();
-        let gap = self
-            .last_activity_time
-            .map_or(100.0, |t| now.duration_since(t).as_secs_f32());
-        let source_changed = self.last_was_rx != Some(is_rx);
-
-        if gap > 3.0 || source_changed {
-            if !self.log_text.is_empty() && !self.log_text.ends_with('\n') {
-                self.log_text.push('\n');
-            }
-            let prefix = if is_rx { "\n[RX] " } else { "\n[TX] " };
-            self.log_text.push_str(prefix);
+        if is_rx {
+            self.pend_rx.push_str(frag);
+            self.pend_rx_at = Some(now);
+        } else {
+            self.pend_tx.push_str(frag);
+            self.pend_tx_at = Some(now);
         }
+    }
 
-        self.log_text.push_str(text);
+    /// Write a discrete status line ([SYS]/[ERR]/[DIAL]). Flushes any in-flight
+    /// runs first so a status message never lands mid-number.
+    fn log_status(&mut self, line: &str) {
+        self.flush_pending(true);
+        if !self.committed.is_empty() && !self.committed.ends_with('\n') {
+            self.committed.push('\n');
+        }
+        self.committed.push_str(line);
+        if !self.committed.ends_with('\n') {
+            self.committed.push('\n');
+        }
+        self.trim_committed();
+    }
 
-        if self.log_text.len() > 16_000 {
-            let mut cut = self.log_text.len() - 12_000;
-            while cut < self.log_text.len() && !self.log_text.is_char_boundary(cut) {
+    /// Commit pending runs to history. `force` flushes regardless of timing;
+    /// otherwise only runs idle for >= LINE_GAP_SECS are committed.
+    fn flush_pending(&mut self, force: bool) {
+        let now = Instant::now();
+        if !self.pend_tx.is_empty() {
+            let idle = self
+                .pend_tx_at
+                .map_or(true, |t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
+            if force || idle {
+                self.committed.push_str(&format!("[TX] {}\n", self.pend_tx));
+                self.pend_tx.clear();
+                self.pend_tx_at = None;
+            }
+        }
+        if !self.pend_rx.is_empty() {
+            let idle = self
+                .pend_rx_at
+                .map_or(true, |t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
+            if force || idle {
+                self.committed.push_str(&format!("[RX] {}\n", self.pend_rx));
+                self.pend_rx.clear();
+                self.pend_rx_at = None;
+            }
+        }
+        self.trim_committed();
+    }
+
+    fn trim_committed(&mut self) {
+        if self.committed.len() > 16_000 {
+            let mut cut = self.committed.len() - 12_000;
+            while cut < self.committed.len() && !self.committed.is_char_boundary(cut) {
                 cut += 1;
             }
-            self.log_text.drain(0..cut);
+            self.committed.drain(0..cut);
         }
+    }
 
-        self.last_activity_time = Some(now);
-        self.last_was_rx = Some(is_rx);
+    /// History plus the live (still-growing) TX and RX runs, for display.
+    fn display_log(&self) -> String {
+        let mut out = self.committed.clone();
+        if !self.pend_tx.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("[TX] ");
+            out.push_str(&self.pend_tx);
+        }
+        if !self.pend_rx.is_empty() {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("[RX] ");
+            out.push_str(&self.pend_rx);
+        }
+        out
+    }
+
+    fn clear_log(&mut self) {
+        self.committed.clear();
+        self.pend_tx.clear();
+        self.pend_rx.clear();
+        self.pend_tx_at = None;
+        self.pend_rx_at = None;
     }
 
     fn play(&mut self, f1: f32, f2: f32, label: &str) {
@@ -128,7 +196,7 @@ impl DtmfApp {
         self.tx_until = Some(Instant::now() + Duration::from_millis(self.tone_ms as u64));
         self.current_f1 = f1;
         self.current_f2 = f2;
-        self.append_to_log(label, false);
+        self.push_tone(label, false);
     }
 
     fn fire_key(&mut self, key: char) {
@@ -164,8 +232,7 @@ impl DtmfApp {
         self.tx_until = None;
         self.current_f1 = 0.0;
         self.current_f2 = 0.0;
-        self.append_to_log("\n[SYS] transmit halted\n", false);
-        self.last_activity_time = None;
+        self.log_status("[SYS] transmit halted");
     }
 
     fn start_dial(&mut self) {
@@ -178,10 +245,9 @@ impl DtmfApp {
         if seq.is_empty() {
             return;
         }
-        self.append_to_log(&format!("\n[DIAL] {}\n", self.dial_input.trim()), false);
+        self.log_status(&format!("[DIAL] {}", self.dial_input.trim()));
         self.dial_queue = seq;
         self.next_fire_at = Some(Instant::now());
-        self.last_activity_time = None;
     }
 
     fn pump_dial(&mut self) {
@@ -299,7 +365,7 @@ impl eframe::App for DtmfApp {
             match msg {
                 AppMessage::DetectedTone(c) => {
                     let s = if c == '⌁' { "[SF]".to_string() } else { c.to_string() };
-                    self.append_to_log(&s, true);
+                    self.push_tone(&s, true);
                 }
                 AppMessage::RxLevel(p) => {
                     if p > self.rx_level {
@@ -307,18 +373,18 @@ impl eframe::App for DtmfApp {
                     }
                 }
                 AppMessage::AudioStatus(m) => {
-                    self.log_text.push_str(&format!("\n[SYS] {m}\n"));
-                    self.last_activity_time = None;
+                    self.log_status(&format!("[SYS] {m}"));
                 }
                 AppMessage::AudioError(e) => {
-                    self.log_text.push_str(&format!("\n[ERR] {e}\n"));
-                    self.last_activity_time = None;
+                    self.log_status(&format!("[ERR] {e}"));
                 }
                 _ => {}
             }
         }
         // smooth peak-hold decay for the meter
         self.rx_level *= 0.85;
+        // commit any run that's gone quiet for >= LINE_GAP_SECS
+        self.flush_pending(false);
 
         let control_frame = egui::Frame::none()
             .fill(PANEL)
@@ -602,15 +668,14 @@ impl eframe::App for DtmfApp {
                     ui.heading(egui::RichText::new("TX/RX LOG").color(AMBER));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("clear").clicked() {
-                            self.log_text.clear();
-                            self.last_activity_time = None;
+                            self.clear_log();
                         }
                     });
                 });
                 ui.separator();
 
-                // clone so the field stays the source of truth but text is selectable/copyable
-                let mut display_text = self.log_text.clone();
+                // history + live runs; clone so it stays read-only but selectable/copyable
+                let mut display_text = self.display_log();
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
