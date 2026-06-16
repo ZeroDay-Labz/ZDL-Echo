@@ -6,6 +6,8 @@ pub enum AppMessage {
     DetectedTone(char),
     /// Live input peak level (0.0..~1.0) for the RX meter.
     RxLevel(f32),
+    /// Most-recent captured samples (decimated) for the oscilloscope.
+    RxWaveform(Vec<f32>),
 
     // TX: outgoing tone commands
     PlayTone { f1: f32, f2: f32, ms: u32 },

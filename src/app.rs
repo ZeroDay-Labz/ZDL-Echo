@@ -51,6 +51,7 @@ pub struct DtmfApp {
     output_devices: Vec<String>,
     selected_output: String,
     rx_level: f32,
+    rx_wave: Vec<f32>,
 
     dial_input: String,
     dial_queue: VecDeque<char>,
@@ -107,6 +108,7 @@ impl DtmfApp {
             output_devices: out_devs,
             selected_output: default_out,
             rx_level: 0.0,
+            rx_wave: Vec::new(),
             dial_input: String::new(),
             dial_queue: VecDeque::new(),
             next_fire_at: None,
@@ -389,6 +391,9 @@ impl eframe::App for DtmfApp {
                         self.rx_level = p;
                     }
                 }
+                AppMessage::RxWaveform(w) => {
+                    self.rx_wave = w;
+                }
                 AppMessage::AudioStatus(m) => {
                     self.log_status(&format!("[SYS] {m}"));
                 }
@@ -639,34 +644,32 @@ impl eframe::App for DtmfApp {
                     egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 40, 20)),
                 );
 
-                if self.tx_active() {
-                    let time = ui.input(|i| i.time) as f32;
-                    let width = rect.width();
-                    let mut points = Vec::new();
-                    for i in 0..width as i32 {
-                        let x = i as f32;
-                        let t = time * 4.0 + (x * 0.015);
-                        let vis_f1 = self.current_f1 * 0.05;
-                        let vis_f2 = self.current_f2 * 0.05;
-                        let w1 = (t * vis_f1).sin();
-                        let w2 = if self.current_f2 > 0.0 { (t * vis_f2).sin() } else { 0.0 };
-                        let mixed = if self.current_f2 > 0.0 { (w1 + w2) * 0.5 } else { w1 };
-                        let y = rect.center().y - (mixed * (rect.height() * 0.4));
-                        points.push(egui::pos2(rect.left() + x, y));
-                    }
-                    painter.add(egui::Shape::line(points, egui::Stroke::new(2.0, GREEN)));
+                // ---- real RX waveform, auto-scaled so quiet tones still show ----
+                let peak = self
+                    .rx_wave
+                    .iter()
+                    .fold(0.0f32, |m, &s| m.max(s.abs()));
 
-                    let freq_text = if self.current_f2 > 0.0 {
-                        format!("{:.0} Hz + {:.0} Hz", self.current_f1, self.current_f2)
-                    } else {
-                        format!("{:.0} Hz (SF)", self.current_f1)
-                    };
+                if self.rx_wave.len() >= 2 && peak > 0.01 {
+                    let n = self.rx_wave.len();
+                    let gain = (rect.height() * 0.42) / peak; // normalize to the snapshot peak
+                    let pts: Vec<egui::Pos2> = self
+                        .rx_wave
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &s)| {
+                            let x = rect.left() + (i as f32 / (n - 1) as f32) * rect.width();
+                            let y = rect.center().y - s * gain;
+                            egui::pos2(x, y)
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, GREEN)));
                     painter.text(
                         rect.left_top() + egui::vec2(8.0, 8.0),
                         egui::Align2::LEFT_TOP,
-                        freq_text,
+                        format!("RX  pk {peak:.2}"),
                         egui::FontId::monospace(14.0),
-                        AMBER,
+                        GREEN,
                     );
                 } else {
                     painter.line_segment(
@@ -679,9 +682,25 @@ impl eframe::App for DtmfApp {
                     painter.text(
                         rect.left_top() + egui::vec2(8.0, 8.0),
                         egui::Align2::LEFT_TOP,
-                        "IDLE",
+                        "RX  (quiet)",
                         egui::FontId::monospace(14.0),
                         AMBER_DIM,
+                    );
+                }
+
+                // TX frequency readout in the corner while transmitting
+                if self.tx_active() {
+                    let tx_text = if self.current_f2 > 0.0 {
+                        format!("TX {:.0}+{:.0} Hz", self.current_f1, self.current_f2)
+                    } else {
+                        format!("TX {:.0} Hz", self.current_f1)
+                    };
+                    painter.text(
+                        rect.right_top() + egui::vec2(-8.0, 8.0),
+                        egui::Align2::RIGHT_TOP,
+                        tx_text,
+                        egui::FontId::monospace(14.0),
+                        AMBER,
                     );
                 }
 

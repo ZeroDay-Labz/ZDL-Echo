@@ -59,6 +59,17 @@ fn downmix<T: Copy>(data: &[T], channels: usize, conv: impl Fn(T) -> f32) -> Vec
 fn emit(decoder: &mut ToneDecoder, mono: &[f32], tx: &Sender<AppMessage>) {
     let peak = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
     let _ = tx.send(AppMessage::RxLevel(peak));
+
+    // scope snapshot: decimate the buffer to ~256 points across its span
+    const TARGET: usize = 256;
+    let wave: Vec<f32> = if mono.len() <= TARGET {
+        mono.to_vec()
+    } else {
+        let step = (mono.len() / TARGET).max(1);
+        mono.iter().step_by(step).take(TARGET).copied().collect()
+    };
+    let _ = tx.send(AppMessage::RxWaveform(wave));
+
     for (_, ch) in decoder.process_samples(mono) {
         let _ = tx.send(AppMessage::DetectedTone(ch));
     }
