@@ -15,14 +15,15 @@
 
 ## Capabilities
 
-* **Dual-Engine Architecture:** Simultaneous TX generation and RX detection using non-blocking multi-threaded DSP pipelines.
+* **Dual-Engine Architecture:** Simultaneous TX generation and RX detection using non-blocking, multi-threaded DSP pipelines separated by crossbeam channels.
+* **Advanced Voice-Falsing Rejection:** Core DSP engine utilizes phase coherence, twist limits (max 8.0 dB), and strict energy dominance thresholds to reject background speech and noise.
 * **Protocol Support:**
-  * **DTMF:** Standard touch-tone generation/decoding.
+  * **DTMF:** Standard touch-tone generation and decoding.
   * **MF (R1):** Inter-office signaling including KP, ST, and digit sets.
-  * **SF:** Single-frequency trunk supervision (2600 Hz).
-* **Real-Time Visualization:** Native oscilloscope rendering for live signal analysis.
-* **Dynamic Audio Routing:** WASAPI-native hardware endpoint scanning, allowing for hot-swapping virtual audio cables (Voicemeeter, Virtual Audio Cable, etc.) at runtime.
-* **Sequence Dialing:** Built-in dial string processor with automated timing gaps for reliable sequence transmission.
+  * **SF:** Single-frequency trunk supervision (2600 Hz TX). *(Note: RX detection for 2600 Hz is disabled by default in source to prevent voice-falsing; toggle `DETECT_SF` in `decoder.rs` to enable).*
+* **Real-Time Visualization:** Native oscilloscope rendering with auto-scaling for live signal analysis.
+* **Dynamic Audio Routing:** WASAPI-native hardware endpoint scanning, allowing for hot-swapping virtual audio cables at runtime without OS-level defaults.
+* **Sequence Dialing:** Built-in dial string processor with automated millisecond timing gaps for reliable sequence transmission.
 
 ---
 
@@ -46,7 +47,7 @@ To analyze signals from specific applications:
 
 ## Building from Source
 
-This project uses `cpal` for low-latency audio hardware access and `egui` for GPU-accelerated rendering.
+This project uses `cpal` for low-latency audio hardware access and `egui` for GPU-accelerated rendering. The build profile is heavily optimized for DSP math operations and binary size reduction.
 
 ```bash
 # Clone the repository
@@ -57,7 +58,8 @@ cd ZDL-Echo
 cargo build --release
 ```
 
-The optimized binary will be generated in `target/release/ZDL-Echo.exe`.
+The compiled executable will be generated at `target/release/ZDL-Echo.exe`.
+*The application is linked to the Windows Subsystem natively, ensuring it launches as a standalone GUI without a background terminal console.*
 
 ---
 
@@ -65,10 +67,11 @@ The optimized binary will be generated in `target/release/ZDL-Echo.exe`.
 
 | Component | Technology |
 | :--- | :--- |
-| **DSP Core** | Goertzel Algorithm (5th Order) |
+| **DSP Core** | Optimized Goertzel Algorithm (2nd-Order IIR) |
 | **Concurrency** | Crossbeam Channel-based messaging |
 | **UI Framework** | Eframe / Egui |
 | **Hardware IO** | CPAL (Cross-Platform Audio Library) |
+| **Compiler Optimization** | LTO enabled, single codegen unit, stripped symbols |
 
 ---
 

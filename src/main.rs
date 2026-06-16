@@ -1,3 +1,6 @@
+#![windows_subsystem = "windows"]
+#![allow(deprecated)]
+
 mod app;
 mod audio;
 mod decoder;
