@@ -5,13 +5,21 @@
 
 ---
 
+## Visual Overview
+
+| Audio Routing Menu | Operational Context   | Main Interface |
+| :--- |:-----------------------------| :--- |
+| ![Main UI](images/img.png) | ![Routing](images/img_1.png) | ![Operations](images/img_2.png) |
+
+---
+
 ## Capabilities
 
 * **Dual-Engine Architecture:** Simultaneous TX generation and RX detection using non-blocking multi-threaded DSP pipelines.
 * **Protocol Support:**
-    * **DTMF:** Standard touch-tone generation/decoding.
-    * **MF (R1):** Inter-office signaling including KP, ST, and digit sets.
-    * **SF:** Single-frequency trunk supervision (2600 Hz).
+  * **DTMF:** Standard touch-tone generation/decoding.
+  * **MF (R1):** Inter-office signaling including KP, ST, and digit sets.
+  * **SF:** Single-frequency trunk supervision (2600 Hz).
 * **Real-Time Visualization:** Native oscilloscope rendering for live signal analysis.
 * **Dynamic Audio Routing:** WASAPI-native hardware endpoint scanning, allowing for hot-swapping virtual audio cables (Voicemeeter, Virtual Audio Cable, etc.) at runtime.
 * **Sequence Dialing:** Built-in dial string processor with automated timing gaps for reliable sequence transmission.
@@ -42,7 +50,7 @@ This project uses `cpal` for low-latency audio hardware access and `egui` for GP
 
 ```bash
 # Clone the repository
-git clone https://github.com/havokzero/ZDL-Echo.git
+git clone [https://github.com/havokzero/ZDL-Echo.git](https://github.com/havokzero/ZDL-Echo.git)
 cd ZDL-Echo
 
 # Compile for production
