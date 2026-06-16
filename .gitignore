@@ -1,1 +1,32 @@
 /target
+# --- Rust Build Output ---
+/target
+
+# --- IDE & Editor Files ---
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+*.userosscache
+
+# --- Windows System Files ---
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Project-Specific Dumps ---
+ZDL-Echo-dump.txt
+*.log
+*.tmp
+
+# --- Binary & Debug Symbols ---
+*.exe
+*.dll
+*.pdb
+*.obj
+*.o
+
+# --- Cargo ---
+# Typically, keep Cargo.lock in version control for binary projects
+# to ensure reproducible builds.
