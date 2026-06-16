@@ -29,7 +29,6 @@ pub fn run_audio_engine(tx_ui: Sender<AppMessage>, rx_audio: Receiver<AppMessage
     };
 
     let output_config: cpal::StreamConfig = output_device.default_output_config().unwrap().into();
-    // FIX: Removed .0 for CPAL 0.18 compatibility
     let sample_rate_out = output_config.sample_rate as f32;
     let out_channels = output_config.channels as usize;
 
@@ -70,7 +69,6 @@ pub fn run_audio_engine(tx_ui: Sender<AppMessage>, rx_audio: Receiver<AppMessage
     macro_rules! build_input {
         ($device:expr) => {{
             let config: cpal::StreamConfig = $device.default_input_config().unwrap().into();
-            // FIX: Removed .0
             let sample_rate = config.sample_rate as f32;
             let channels = config.channels as usize;
             let mut decoder = ToneDecoder::new(sample_rate);
@@ -80,9 +78,15 @@ pub fn run_audio_engine(tx_ui: Sender<AppMessage>, rx_audio: Receiver<AppMessage
             let stream = $device.build_input_stream(
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mono: Vec<f32> = data.chunks(channels).map(|f| f.iter().sum::<f32>() / channels as f32).collect();
-                    let hits = decoder.process_samples(&mono);
-                    for (_, ch) in hits {
+                    let ch = channels.max(1);
+                    let mono: Vec<f32> =
+                        data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect();
+
+                    // Report input level so the UI meter proves audio is arriving.
+                    let peak = mono.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                    let _ = tx_in_data.send(AppMessage::RxLevel(peak));
+
+                    for (_, ch) in decoder.process_samples(&mono) {
                         let _ = tx_in_data.send(AppMessage::DetectedTone(ch));
                     }
                 },
@@ -106,7 +110,7 @@ pub fn run_audio_engine(tx_ui: Sender<AppMessage>, rx_audio: Receiver<AppMessage
                 let mut found = false;
                 if let Ok(devices) = host.input_devices() {
                     for dev in devices {
-                        // FIX: Replaced .name() with Native Display trait via .to_string()
+                        // cpal 0.18.1: Device implements Display, so to_string() is the name.
                         if dev.to_string() == name {
                             _active_input_stream = Some(build_input!(dev));
                             let _ = tx_ui.send(AppMessage::AudioStatus(format!("Hooked to: {}", name)));

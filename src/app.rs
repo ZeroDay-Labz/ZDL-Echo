@@ -4,19 +4,24 @@ use eframe::egui;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use cpal::traits::HostTrait; // Removed unused DeviceTrait
+use cpal::traits::HostTrait;
 use crate::types::AppMessage;
 use crate::generator::{get_dtmf_freqs, get_mf_freqs};
 
-const BG: egui::Color32       = egui::Color32::from_rgb(8, 8, 8);
-const PANEL: egui::Color32    = egui::Color32::from_rgb(13, 13, 13);
-const TERM_BG: egui::Color32  = egui::Color32::from_rgb(5, 5, 5);
-const CHARCOAL: egui::Color32 = egui::Color32::from_rgb(22, 22, 22);
-const BORDER: egui::Color32   = egui::Color32::from_rgb(40, 40, 40);
-const GREEN: egui::Color32    = egui::Color32::from_rgb(0, 255, 90);
-const DIM: egui::Color32      = egui::Color32::from_rgb(0, 110, 50);
-const RED: egui::Color32      = egui::Color32::from_rgb(255, 70, 70);
-const WHITE: egui::Color32    = egui::Color32::from_rgb(220, 220, 220);
+// ---- phosphor palette ----
+const BG: egui::Color32        = egui::Color32::from_rgb(8, 8, 8);
+const PANEL: egui::Color32     = egui::Color32::from_rgb(13, 13, 13);
+const TERM_BG: egui::Color32   = egui::Color32::from_rgb(5, 5, 5);
+const CHARCOAL: egui::Color32  = egui::Color32::from_rgb(22, 22, 22);
+const BORDER: egui::Color32    = egui::Color32::from_rgb(40, 40, 40);
+const GREEN: egui::Color32     = egui::Color32::from_rgb(0, 255, 90);
+const DIM: egui::Color32       = egui::Color32::from_rgb(0, 110, 50);
+const RED: egui::Color32       = egui::Color32::from_rgb(255, 70, 70);
+const WHITE: egui::Color32     = egui::Color32::from_rgb(220, 220, 220);
+// amber CRT accents — homage to the old monochrome amber monitors
+const AMBER: egui::Color32     = egui::Color32::from_rgb(255, 176, 0);
+const AMBER_DIM: egui::Color32 = egui::Color32::from_rgb(150, 100, 0);
+const AMBER_SEL: egui::Color32 = egui::Color32::from_rgb(74, 52, 0); // selection bg — text stays readable
 
 const DIAL_GAP_MS: u64 = 70;
 
@@ -37,6 +42,7 @@ pub struct DtmfApp {
 
     input_devices: Vec<String>,
     selected_input: String,
+    rx_level: f32,
 
     dial_input: String,
     dial_queue: VecDeque<char>,
@@ -54,8 +60,6 @@ impl DtmfApp {
     pub fn new(tx: Sender<AppMessage>, rx: Receiver<AppMessage>) -> Self {
         let host = cpal::default_host();
         let mut in_devs = Vec::new();
-
-        // FIX: In CPAL 0.18.1, Device natively implements Display. No .name() needed.
         if let Ok(devices) = host.input_devices() {
             for d in devices {
                 in_devs.push(d.to_string());
@@ -63,7 +67,8 @@ impl DtmfApp {
         }
         in_devs.dedup();
 
-        let default_in = host.default_input_device()
+        let default_in = host
+            .default_input_device()
             .map(|d| d.to_string())
             .unwrap_or_default();
 
@@ -77,6 +82,7 @@ impl DtmfApp {
             show_routing: false,
             input_devices: in_devs,
             selected_input: default_in,
+            rx_level: 0.0,
             dial_input: String::new(),
             dial_queue: VecDeque::new(),
             next_fire_at: None,
@@ -90,7 +96,9 @@ impl DtmfApp {
 
     fn append_to_log(&mut self, text: &str, is_rx: bool) {
         let now = Instant::now();
-        let gap = self.last_activity_time.map_or(100.0, |t| now.duration_since(t).as_secs_f32());
+        let gap = self
+            .last_activity_time
+            .map_or(100.0, |t| now.duration_since(t).as_secs_f32());
         let source_changed = self.last_was_rx != Some(is_rx);
 
         if gap > 3.0 || source_changed {
@@ -104,7 +112,10 @@ impl DtmfApp {
         self.log_text.push_str(text);
 
         if self.log_text.len() > 16_000 {
-            let cut = self.log_text.len() - 12_000;
+            let mut cut = self.log_text.len() - 12_000;
+            while cut < self.log_text.len() && !self.log_text.is_char_boundary(cut) {
+                cut += 1;
+            }
             self.log_text.drain(0..cut);
         }
 
@@ -196,18 +207,51 @@ impl DtmfApp {
         self.tx_until.map_or(false, |t| Instant::now() < t)
     }
 
+    /// Horizontal input-level bar. Green (quiet) -> amber -> red (hot).
+    fn draw_level_meter(&self, ui: &mut egui::Ui, height: f32) {
+        let w = ui.available_width();
+        let (resp, painter) =
+            ui.allocate_painter(egui::vec2(w, height), egui::Sense::hover());
+        let r = resp.rect;
+        painter.rect_filled(r, 0.0, egui::Color32::from_rgb(10, 10, 10));
+
+        let lvl = self.rx_level.clamp(0.0, 1.0);
+        let shown = lvl.sqrt(); // lift quiet signals so they're visible
+        let fill_w = r.width() * shown;
+        if fill_w > 1.0 {
+            let col = if lvl > 0.5 {
+                RED
+            } else if lvl > 0.12 {
+                AMBER
+            } else {
+                GREEN
+            };
+            let fill = egui::Rect::from_min_size(r.min, egui::vec2(fill_w, r.height()));
+            painter.rect_filled(fill, 0.0, col);
+        }
+        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    }
+
     fn apply_style(&self, ctx: &egui::Context) {
         let mut v = egui::Visuals::dark();
         v.window_fill = BG;
         v.panel_fill = BG;
+
         v.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
         v.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
         v.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
         v.widgets.active.corner_radius = egui::CornerRadius::ZERO;
-        v.selection.bg_fill = GREEN;
+
+        // selection in dark amber so highlighted text / items stay readable
+        // (was solid green-on-green = invisible).
+        v.selection.bg_fill = AMBER_SEL;
+        v.selection.stroke = egui::Stroke::new(1.0, AMBER);
+
         v.widgets.hovered.bg_fill = CHARCOAL;
-        v.widgets.active.bg_fill = GREEN;
+        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, AMBER);
+        v.widgets.active.bg_fill = AMBER;
         v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+
         ctx.set_visuals(v);
 
         let mut style = (*ctx.global_style()).clone();
@@ -250,22 +294,31 @@ impl eframe::App for DtmfApp {
 
         self.pump_dial();
 
+        // ---- drain audio-thread messages ----
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::DetectedTone(c) => {
-                    self.append_to_log(&c.to_string(), true);
-                },
-                AppMessage::AudioStatus(msg) => {
-                    self.log_text.push_str(&format!("\n[SYS] {msg}\n"));
+                    let s = if c == '⌁' { "[SF]".to_string() } else { c.to_string() };
+                    self.append_to_log(&s, true);
+                }
+                AppMessage::RxLevel(p) => {
+                    if p > self.rx_level {
+                        self.rx_level = p;
+                    }
+                }
+                AppMessage::AudioStatus(m) => {
+                    self.log_text.push_str(&format!("\n[SYS] {m}\n"));
                     self.last_activity_time = None;
-                },
-                AppMessage::AudioError(err) => {
-                    self.log_text.push_str(&format!("\n[ERR] {err}\n"));
+                }
+                AppMessage::AudioError(e) => {
+                    self.log_text.push_str(&format!("\n[ERR] {e}\n"));
                     self.last_activity_time = None;
-                },
+                }
                 _ => {}
             }
         }
+        // smooth peak-hold decay for the meter
+        self.rx_level *= 0.85;
 
         let control_frame = egui::Frame::none()
             .fill(PANEL)
@@ -276,6 +329,7 @@ impl eframe::App for DtmfApp {
             .stroke(egui::Stroke::new(1.0, DIM))
             .inner_margin(14.0);
 
+        // ---- top bar ----
         egui::TopBottomPanel::top("menu").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("SYSTEM", |ui| {
@@ -290,311 +344,401 @@ impl eframe::App for DtmfApp {
                 });
 
                 ui.menu_button("ROUTING", |ui| {
-                    if ui.button("View Hardware Endpoints").clicked() {
+                    if ui.button("Capture Source / Endpoints").clicked() {
                         self.show_routing = true;
                         ui.close();
                     }
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("ZDL-ECHO").color(GREEN).strong());
+                    ui.label(egui::RichText::new("ZDL-ECHO").color(AMBER).strong());
                 });
             });
         });
 
-        egui::SidePanel::left("controls").exact_width(244.0).frame(control_frame).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-
-                ui.label(egui::RichText::new("RX CAPTURE SOURCE").color(DIM).size(11.0));
-                ui.scope(|ui| {
-                    ui.visuals_mut().widgets.inactive.bg_fill = CHARCOAL;
-
-                    let display_name = if self.selected_input.len() > 24 {
-                        format!("{}...", &self.selected_input[..21])
+        // ---- control deck ----
+        egui::SidePanel::left("controls")
+            .exact_width(244.0)
+            .frame(control_frame)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // RX signal presence
+                    ui.label(egui::RichText::new("RX SIGNAL").color(AMBER_DIM).size(11.0));
+                    self.draw_level_meter(ui, 16.0);
+                    let src = if self.selected_input.is_empty() {
+                        "— no source —".to_string()
                     } else {
                         self.selected_input.clone()
                     };
+                    ui.label(egui::RichText::new(src).color(DIM).size(10.0));
+                    ui.label(
+                        egui::RichText::new("source > ROUTING menu")
+                            .color(AMBER_DIM)
+                            .size(9.0),
+                    );
 
-                    egui::ComboBox::from_id_source("rx_source")
-                        .selected_text(display_name)
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for dev in &self.input_devices {
-                                let label = if dev.len() > 40 { format!("{}...", &dev[..37]) } else { dev.clone() };
-                                if ui.selectable_value(&mut self.selected_input, dev.clone(), label).changed() {
-                                    let _ = self.tx.send(AppMessage::SetInputDevice(dev.clone()));
-                                }
-                            }
-                        });
-                });
+                    ui.add_space(14.0);
 
-                ui.add_space(14.0);
-
-                ui.label(egui::RichText::new("MODE").color(DIM).size(11.0));
-                ui.scope(|ui| {
-                    ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgb(60, 60, 60);
+                    // MODE — dimmed, amber active
+                    ui.label(egui::RichText::new("MODE").color(AMBER_DIM).size(11.0));
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.mode, Mode::Dtmf, "DTMF");
-                        ui.selectable_value(&mut self.mode, Mode::Mf, "MF");
+                        for (m, lbl) in [(Mode::Dtmf, "DTMF"), (Mode::Mf, "MF")] {
+                            let active = self.mode == m;
+                            let (txt, fill) = if active {
+                                (egui::Color32::BLACK, AMBER)
+                            } else {
+                                (DIM, CHARCOAL)
+                            };
+                            if ui
+                                .add_sized(
+                                    [70.0, 26.0],
+                                    egui::Button::new(egui::RichText::new(lbl).color(txt))
+                                        .fill(fill),
+                                )
+                                .clicked()
+                            {
+                                self.mode = m;
+                            }
+                        }
                     });
-                });
 
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new("DURATION").color(DIM).size(11.0));
-                ui.add(egui::Slider::new(&mut self.tone_ms, 40..=600).suffix(" ms"));
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("DURATION").color(AMBER_DIM).size(11.0));
+                    ui.add(egui::Slider::new(&mut self.tone_ms, 40..=600).suffix(" ms"));
 
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new("DIAL STRING").color(DIM).size(11.0));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.dial_input)
-                        .hint_text("18005551234")
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let dialing = !self.dial_queue.is_empty();
-                    if dialing {
-                        if ui
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("DIAL STRING").color(AMBER_DIM).size(11.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.dial_input)
+                            .hint_text("18005551234")
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let dialing = !self.dial_queue.is_empty();
+                        if dialing {
+                            if ui
+                                .add_sized(
+                                    [110.0, 28.0],
+                                    egui::Button::new(egui::RichText::new("ABORT").color(WHITE))
+                                        .fill(egui::Color32::from_rgb(60, 14, 14)),
+                                )
+                                .clicked()
+                            {
+                                self.stop();
+                            }
+                        } else if ui
                             .add_sized(
                                 [110.0, 28.0],
-                                egui::Button::new(
-                                    egui::RichText::new("ABORT").color(WHITE),
-                                )
-                                    .fill(egui::Color32::from_rgb(60, 14, 14)),
+                                egui::Button::new(egui::RichText::new("DIAL").color(GREEN))
+                                    .fill(CHARCOAL),
                             )
                             .clicked()
                         {
-                            self.stop();
+                            self.start_dial();
                         }
-                    } else if ui
+
+                        let (dot, col, txt) = if self.tx_active() {
+                            ("\u{25CF}", RED, "TX")
+                        } else {
+                            ("\u{25CB}", DIM, "idle")
+                        };
+                        ui.label(egui::RichText::new(format!("{dot} {txt}")).color(col));
+                    });
+
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("SUPERVISORY").color(AMBER_DIM).size(11.0));
+                    if ui
                         .add_sized(
-                            [110.0, 28.0],
-                            egui::Button::new(
-                                egui::RichText::new("DIAL").color(GREEN),
-                            )
+                            [ui.available_width(), 36.0],
+                            egui::Button::new(egui::RichText::new("2600 Hz").size(16.0).color(RED))
                                 .fill(CHARCOAL),
                         )
                         .clicked()
                     {
-                        self.start_dial();
+                        self.fire_sf();
                     }
-
-                    let (dot, col, txt) = if self.tx_active() {
-                        ("\u{25CF}", RED, "TX")
-                    } else {
-                        ("\u{25CB}", DIM, "idle")
-                    };
-                    ui.label(egui::RichText::new(format!("{dot} {txt}")).color(col));
-                });
-
-                ui.add_space(14.0);
-                ui.label(egui::RichText::new("SUPERVISORY").color(DIM).size(11.0));
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 36.0],
-                        egui::Button::new(egui::RichText::new("2600 Hz").size(16.0).color(RED))
-                            .fill(CHARCOAL),
-                    )
-                    .clicked()
-                {
-                    self.fire_sf();
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.add_sized([70.0, 28.0], egui::Button::new("KP").fill(CHARCOAL)).clicked() {
-                        self.fire_mf("KP");
-                    }
-                    if ui.add_sized([70.0, 28.0], egui::Button::new("KP2").fill(CHARCOAL)).clicked() {
-                        self.fire_mf("KP2");
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.add_sized([45.0, 28.0], egui::Button::new("ST").fill(CHARCOAL)).clicked() {
-                        self.fire_mf("ST");
-                    }
-                    if ui.add_sized([45.0, 28.0], egui::Button::new("ST2").fill(CHARCOAL)).clicked() {
-                        self.fire_mf("ST2");
-                    }
-                    if ui.add_sized([45.0, 28.0], egui::Button::new("ST3").fill(CHARCOAL)).clicked() {
-                        self.fire_mf("ST3");
-                    }
-                });
-
-                ui.add_space(14.0);
-                ui.label(egui::RichText::new("KEYPAD").color(DIM).size(11.0));
-                let matrix = [
-                    ['1', '2', '3', 'A'],
-                    ['4', '5', '6', 'B'],
-                    ['7', '8', '9', 'C'],
-                    ['*', '0', '#', 'D'],
-                ];
-                egui::Grid::new("keypad").spacing([6.0, 6.0]).show(ui, |ui| {
-                    for row in matrix {
-                        for key in row {
-                            let enabled =
-                                matches!(self.mode, Mode::Dtmf) || key.is_ascii_digit();
-                            let col = if enabled { GREEN } else { DIM };
-                            let btn = egui::Button::new(
-                                egui::RichText::new(key.to_string()).size(19.0).color(col),
-                            )
-                                .fill(CHARCOAL);
-                            if ui.add_enabled(enabled, btn).clicked() {
-                                self.fire_key(key);
-                            }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_sized([70.0, 28.0], egui::Button::new("KP").fill(CHARCOAL)).clicked() {
+                            self.fire_mf("KP");
                         }
-                        ui.end_row();
-                    }
-                });
+                        if ui.add_sized([70.0, 28.0], egui::Button::new("KP2").fill(CHARCOAL)).clicked() {
+                            self.fire_mf("KP2");
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_sized([45.0, 28.0], egui::Button::new("ST").fill(CHARCOAL)).clicked() {
+                            self.fire_mf("ST");
+                        }
+                        if ui.add_sized([45.0, 28.0], egui::Button::new("ST2").fill(CHARCOAL)).clicked() {
+                            self.fire_mf("ST2");
+                        }
+                        if ui.add_sized([45.0, 28.0], egui::Button::new("ST3").fill(CHARCOAL)).clicked() {
+                            self.fire_mf("ST3");
+                        }
+                    });
 
-                ui.add_space(14.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new(egui::RichText::new("STOP  (space)").color(WHITE))
-                            .fill(egui::Color32::from_rgb(60, 14, 14)),
-                    )
-                    .clicked()
-                {
-                    self.stop();
-                }
-            });
-        });
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("KEYPAD").color(AMBER_DIM).size(11.0));
+                    let matrix = [
+                        ['1', '2', '3', 'A'],
+                        ['4', '5', '6', 'B'],
+                        ['7', '8', '9', 'C'],
+                        ['*', '0', '#', 'D'],
+                    ];
+                    egui::Grid::new("keypad").spacing([6.0, 6.0]).show(ui, |ui| {
+                        for row in matrix {
+                            for key in row {
+                                let enabled =
+                                    matches!(self.mode, Mode::Dtmf) || key.is_ascii_digit();
+                                let col = if enabled { GREEN } else { DIM };
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(key.to_string()).size(19.0).color(col),
+                                )
+                                    .fill(CHARCOAL);
+                                if ui.add_enabled(enabled, btn).clicked() {
+                                    self.fire_key(key);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
 
-        egui::CentralPanel::default().frame(terminal_frame).show_inside(ui, |ui| {
-
-            ui.heading(egui::RichText::new("SIGNAL OSCILLOSCOPE").color(GREEN));
-            ui.separator();
-
-            let osc_height = 100.0;
-            let (response, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), osc_height), egui::Sense::hover());
-            let rect = response.rect;
-
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 8, 8));
-            // FIX: egui::StrokeKind::Inside successfully added
-            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-            painter.line_segment([egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 40, 20)));
-
-            if self.tx_active() {
-                let time = ui.input(|i| i.time) as f32;
-                let width = rect.width();
-
-                let mut points = Vec::new();
-                for i in 0..width as i32 {
-                    let x = i as f32;
-                    let t = time * 4.0 + (x * 0.015);
-
-                    let vis_f1 = self.current_f1 * 0.05;
-                    let vis_f2 = self.current_f2 * 0.05;
-
-                    let w1 = (t * vis_f1).sin();
-                    let w2 = if self.current_f2 > 0.0 { (t * vis_f2).sin() } else { 0.0 };
-                    let mixed = if self.current_f2 > 0.0 { (w1 + w2) * 0.5 } else { w1 };
-
-                    let y = rect.center().y - (mixed * (rect.height() * 0.4));
-                    points.push(egui::pos2(rect.left() + x, y));
-                }
-
-                painter.add(egui::Shape::line(points, egui::Stroke::new(2.0, GREEN)));
-
-                let freq_text = if self.current_f2 > 0.0 {
-                    format!("{:.0} Hz + {:.0} Hz", self.current_f1, self.current_f2)
-                } else {
-                    format!("{:.0} Hz (SF)", self.current_f1)
-                };
-                painter.text(rect.left_top() + egui::vec2(8.0, 8.0), egui::Align2::LEFT_TOP, freq_text, egui::FontId::monospace(14.0), GREEN);
-            } else {
-                painter.line_segment([egui::pos2(rect.left(), rect.center().y), egui::pos2(rect.right(), rect.center().y)], egui::Stroke::new(2.0, DIM));
-                painter.text(rect.left_top() + egui::vec2(8.0, 8.0), egui::Align2::LEFT_TOP, "IDLE", egui::FontId::monospace(14.0), DIM);
-            }
-
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("TX/RX LOG").color(GREEN));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("clear").clicked() {
-                        self.log_text.clear();
-                        self.last_activity_time = None;
+                    ui.add_space(14.0);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 34.0],
+                            egui::Button::new(egui::RichText::new("STOP  (space)").color(WHITE))
+                                .fill(egui::Color32::from_rgb(60, 14, 14)),
+                        )
+                        .clicked()
+                    {
+                        self.stop();
                     }
                 });
             });
-            ui.separator();
 
-            let mut display_text = self.log_text.clone();
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.add_sized(
-                        ui.available_size(),
-                        egui::TextEdit::multiline(&mut display_text)
-                            .frame(egui::Frame::none())
-                            .font(egui::TextStyle::Monospace)
-                            .text_color(GREEN),
+        // ---- central: scope + log ----
+        egui::CentralPanel::default()
+            .frame(terminal_frame)
+            .show_inside(ui, |ui| {
+                ui.heading(egui::RichText::new("SIGNAL OSCILLOSCOPE").color(AMBER));
+                ui.separator();
+
+                let osc_height = 100.0;
+                let (response, painter) = ui.allocate_painter(
+                    egui::vec2(ui.available_width(), osc_height),
+                    egui::Sense::hover(),
+                );
+                let rect = response.rect;
+
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(8, 8, 8));
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::pos2(rect.right(), rect.center().y),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 40, 20)),
+                );
+
+                if self.tx_active() {
+                    let time = ui.input(|i| i.time) as f32;
+                    let width = rect.width();
+                    let mut points = Vec::new();
+                    for i in 0..width as i32 {
+                        let x = i as f32;
+                        let t = time * 4.0 + (x * 0.015);
+                        let vis_f1 = self.current_f1 * 0.05;
+                        let vis_f2 = self.current_f2 * 0.05;
+                        let w1 = (t * vis_f1).sin();
+                        let w2 = if self.current_f2 > 0.0 { (t * vis_f2).sin() } else { 0.0 };
+                        let mixed = if self.current_f2 > 0.0 { (w1 + w2) * 0.5 } else { w1 };
+                        let y = rect.center().y - (mixed * (rect.height() * 0.4));
+                        points.push(egui::pos2(rect.left() + x, y));
+                    }
+                    painter.add(egui::Shape::line(points, egui::Stroke::new(2.0, GREEN)));
+
+                    let freq_text = if self.current_f2 > 0.0 {
+                        format!("{:.0} Hz + {:.0} Hz", self.current_f1, self.current_f2)
+                    } else {
+                        format!("{:.0} Hz (SF)", self.current_f1)
+                    };
+                    painter.text(
+                        rect.left_top() + egui::vec2(8.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        freq_text,
+                        egui::FontId::monospace(14.0),
+                        AMBER,
                     );
-                });
-        });
+                } else {
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.left(), rect.center().y),
+                            egui::pos2(rect.right(), rect.center().y),
+                        ],
+                        egui::Stroke::new(2.0, DIM),
+                    );
+                    painter.text(
+                        rect.left_top() + egui::vec2(8.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        "IDLE",
+                        egui::FontId::monospace(14.0),
+                        AMBER_DIM,
+                    );
+                }
 
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new("TX/RX LOG").color(AMBER));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("clear").clicked() {
+                            self.log_text.clear();
+                            self.last_activity_time = None;
+                        }
+                    });
+                });
+                ui.separator();
+
+                // clone so the field stays the source of truth but text is selectable/copyable
+                let mut display_text = self.log_text.clone();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut display_text)
+                                .frame(egui::Frame::none())
+                                .font(egui::TextStyle::Monospace)
+                                .text_color(GREEN),
+                        );
+                    });
+            });
+
+        // ---- routing / capture-source window ----
         if self.show_routing {
             let mut close_routing = false;
+            // .open() must borrow a LOCAL, not a field of self — the closure below
+            // needs &mut self, and borrowing self.show_routing here would collide.
+            let mut keep_open = true;
             egui::Window::new("AUDIO ROUTING")
-                .collapsible(false).resizable(false)
-                .open(&mut self.show_routing)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut keep_open)
                 .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(15, 15, 15)))
                 .show(&ctx, |ui| {
-                    ui.label(egui::RichText::new("DETECTED KERNEL ENDPOINTS").color(GREEN).strong());
-                    ui.separator();
+                    ui.set_max_width(380.0);
 
-                    ui.label(egui::RichText::new("INPUT (RX)").color(DIM));
-                    for dev in &self.input_devices {
-                        ui.label(format!("- {}", dev));
-                    }
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("NOTE: To capture specific applications, route them to a Voicemeeter AUX Virtual Cable in Windows, and set that cable via the Dropdown in the Control Deck.").color(egui::Color32::from_rgb(200, 150, 0)));
+                    ui.label(egui::RichText::new("RX CAPTURE SOURCE").color(AMBER).strong());
+                    ui.label(
+                        egui::RichText::new("live input level")
+                            .color(AMBER_DIM)
+                            .size(10.0),
+                    );
+                    self.draw_level_meter(ui, 20.0);
+
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("ACTIVE:").color(AMBER_DIM).size(10.0));
+                    let active = if self.selected_input.is_empty() {
+                        "— none —".to_string()
+                    } else {
+                        self.selected_input.clone()
+                    };
+                    ui.label(egui::RichText::new(active).color(GREEN));
+
+                    ui.add_space(8.0);
                     ui.separator();
-                    if ui.button("[ CLOSE ]").clicked() { close_routing = true; }
+                    ui.label(egui::RichText::new("ENDPOINTS (click to hook)").color(AMBER_DIM).size(10.0));
+
+                    let current = self.selected_input.clone();
+                    let mut clicked: Option<String> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for dev in &self.input_devices {
+                                let sel = *dev == current;
+                                let color = if sel { AMBER } else { GREEN };
+                                if ui
+                                    .selectable_label(sel, egui::RichText::new(dev).color(color))
+                                    .clicked()
+                                {
+                                    clicked = Some(dev.clone());
+                                }
+                            }
+                        });
+                    if let Some(d) = clicked {
+                        self.selected_input = d.clone();
+                        let _ = self.tx.send(AppMessage::SetInputDevice(d));
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "To capture a specific app, route it to a Voicemeeter virtual \
+                             input in Voicemeeter, then pick that bus (e.g. \"Voicemeeter Out B1\") \
+                             above. ZDL-Echo captures the device; Voicemeeter does the per-app routing.",
+                        )
+                            .color(AMBER_DIM),
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("[ CLOSE ]").clicked() {
+                        close_routing = true;
+                    }
                 });
-            if close_routing { self.show_routing = false; }
+            if close_routing || !keep_open {
+                self.show_routing = false;
+            }
         }
 
+        // ---- about window ----
         if self.show_about {
             let mut acknowledge_clicked = false;
-
             egui::Window::new("SYS_INFO")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.show_about)
                 .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(15, 15, 15)))
                 .show(&ctx, |ui| {
-                    ui.heading(egui::RichText::new("PROJECT: ZDL-ECHO").color(egui::Color32::from_rgb(0, 255, 0)));
+                    ui.set_max_width(360.0);
+                    ui.heading(egui::RichText::new("PROJECT: ZDL-ECHO").color(AMBER));
                     ui.label("TELECOM RESEARCH & SIGNALING TOOLKIT");
                     ui.separator();
 
                     ui.add_space(6.0);
                     ui.label("DTMF — touch-tone dialing");
-                    ui.label("MF    — R1 inter-office (KP / digits / ST)");
-                    ui.label("2600  — single-frequency supervisory");
+                    ui.label("MF   — R1 inter-office (KP / digits / ST)");
+                    ui.label("2600 — single-frequency supervisory");
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("space = stop all tones").color(egui::Color32::from_rgb(150, 150, 150)));
+                    ui.label(
+                        egui::RichText::new("space = stop all tones").color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
                     ui.add_space(10.0);
                     ui.separator();
 
                     ui.label("Created By: havok");
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("BROUGHT TO YOU BY ZERO DAY LABS")
-                        .color(egui::Color32::from_rgb(255, 176, 0))
-                        .strong());
-
+                    ui.label(
+                        egui::RichText::new("BROUGHT TO YOU BY ZERO DAY LABS")
+                            .color(AMBER)
+                            .strong(),
+                    );
                     ui.add_space(10.0);
                     ui.label("WARNING: FOR AUTHORIZED DIAGNOSTICS ONLY.");
                     ui.separator();
-
                     if ui.button("[ ACKNOWLEDGE ]").clicked() {
                         acknowledge_clicked = true;
                     }
                 });
-
             if acknowledge_clicked {
                 self.show_about = false;
             }
@@ -605,7 +749,7 @@ impl eframe::App for DtmfApp {
         } else if !self.dial_queue.is_empty() {
             Duration::from_millis(8)
         } else {
-            Duration::from_millis(50)
+            Duration::from_millis(33)
         };
         ctx.request_repaint_after(repaint);
     }

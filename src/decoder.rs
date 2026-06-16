@@ -23,12 +23,14 @@ impl ToneDecoder {
             sample_rate,
             block_size: (sample_rate * 0.020) as usize,
             sample_buffer: Vec::with_capacity((sample_rate * 0.020) as usize),
-            min_magnitude: 0.5,       // HYPER-SENSITIVE: lowered from 1.5 to catch quiet cables
-            max_twist_db: 10.0,       // Tolerates slight distortion from virtual software cables
+            min_magnitude: 0.5,   // sensitive enough for quiet virtual cables
+            max_twist_db: 10.0,   // tolerate distortion from software cables
             drift_allowance: 0.015,
             last_detected: None,
             consecutive_hits: 0,
-            required_hits: 1,         // Immediate reaction
+            required_hits: 2,     // confirm over 2 blocks (~40ms) to reject noise.
+            // Drop to 1 for instant response now that the
+            // emit logic below is fixed.
             silence_count: 0,
             required_silence: 1,
         }
@@ -43,14 +45,21 @@ impl ToneDecoder {
             if self.sample_buffer.len() >= self.block_size {
                 if let Some((tone_type, ch)) = self.analyze_block() {
                     self.silence_count = 0;
+
                     if self.last_detected == Some((tone_type, ch)) {
                         self.consecutive_hits += 1;
-                        if self.consecutive_hits == self.required_hits {
-                            detected_events.push((tone_type, ch));
-                        }
                     } else {
                         self.last_detected = Some((tone_type, ch));
                         self.consecutive_hits = 1;
+                    }
+
+                    // EMIT EXACTLY ONCE, when we hit the confirm count. This MUST
+                    // live outside the if/else above — when it was nested in the
+                    // "same as last" branch, a fresh tone set hits=1 in the else
+                    // branch and the check never ran, so required_hits=1 emitted
+                    // nothing, ever.
+                    if self.consecutive_hits == self.required_hits {
+                        detected_events.push((tone_type, ch));
                     }
                 } else {
                     self.silence_count += 1;
@@ -68,7 +77,7 @@ impl ToneDecoder {
     fn analyze_block(&self) -> Option<(ToneType, char)> {
         let total_energy: f32 = self.sample_buffer.iter().map(|&x| x * x).sum();
         let avg_energy = total_energy / (self.block_size as f32);
-        if avg_energy < 0.000001 { return None; } // Lowered squelch threshold
+        if avg_energy < 0.000001 { return None; } // squelch
 
         let sf_mag = self.goertzel_with_drift(2600.0);
         if sf_mag > self.min_magnitude && sf_mag > avg_energy * 10.0 {
