@@ -26,6 +26,9 @@ const AMBER_SEL: egui::Color32 = egui::Color32::from_rgb(74, 52, 0); // selectio
 const DIAL_GAP_MS: u64 = 70;
 /// Silence (seconds) that ends a captured/transmitted run and starts a new line.
 const LINE_GAP_SECS: f32 = 3.0;
+/// After a tone is transmitted, keep ignoring RX for this long so the loopback
+/// of our own tone (which arrives late through the audio path) isn't decoded.
+const RX_MUTE_GRACE_MS: u64 = 250;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -57,6 +60,7 @@ pub struct DtmfApp {
     dial_queue: VecDeque<char>,
     next_fire_at: Option<Instant>,
     tx_until: Option<Instant>,
+    rx_mute_until: Option<Instant>,
 
     current_f1: f32,
     current_f2: f32,
@@ -113,6 +117,7 @@ impl DtmfApp {
             dial_queue: VecDeque::new(),
             next_fire_at: None,
             tx_until: None,
+            rx_mute_until: None,
             current_f1: 0.0,
             current_f2: 0.0,
         }
@@ -213,6 +218,10 @@ impl DtmfApp {
     fn play(&mut self, f1: f32, f2: f32, label: &str) {
         let _ = self.tx.send(AppMessage::PlayTone { f1, f2, ms: self.tone_ms });
         self.tx_until = Some(Instant::now() + Duration::from_millis(self.tone_ms as u64));
+        // ignore RX through the end of this tone plus a grace period
+        self.rx_mute_until = Some(
+            Instant::now() + Duration::from_millis(self.tone_ms as u64 + RX_MUTE_GRACE_MS),
+        );
         self.current_f1 = f1;
         self.current_f2 = f2;
         self.push_tone(label, false);
@@ -249,9 +258,15 @@ impl DtmfApp {
         self.dial_queue.clear();
         self.next_fire_at = None;
         self.tx_until = None;
+        self.rx_mute_until = Some(Instant::now() + Duration::from_millis(RX_MUTE_GRACE_MS));
         self.current_f1 = 0.0;
         self.current_f2 = 0.0;
         self.log_status("[SYS] transmit halted");
+    }
+
+    fn rx_muted(&self) -> bool {
+        self.rx_mute_until
+            .map_or(false, |t| Instant::now() < t)
     }
 
     fn start_dial(&mut self) {
@@ -383,8 +398,11 @@ impl eframe::App for DtmfApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::DetectedTone(c) => {
-                    let s = if c == '⌁' { "[SF]".to_string() } else { c.to_string() };
-                    self.push_tone(&s, true);
+                    // skip our own transmitted tones echoing back through capture
+                    if !self.rx_muted() {
+                        let s = if c == '⌁' { "[SF]".to_string() } else { c.to_string() };
+                        self.push_tone(&s, true);
+                    }
                 }
                 AppMessage::RxLevel(p) => {
                     if p > self.rx_level {
