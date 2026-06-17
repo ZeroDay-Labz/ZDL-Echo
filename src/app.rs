@@ -36,6 +36,26 @@ enum Mode {
     Mf,
 }
 
+/// Convert an old named-exchange string to a dialable digit string using the
+/// telephone keypad letter map (ABC=2, DEF=3, ...). Digits and * # pass through;
+/// separators (space, hyphen, parens) are dropped. e.g. "CA1-1234" -> "2211234".
+fn letters_to_digits(s: &str) -> String {
+    s.chars()
+        .filter_map(|c| match c.to_ascii_uppercase() {
+            d @ ('0'..='9' | '*' | '#') => Some(d),
+            'A'..='C' => Some('2'),
+            'D'..='F' => Some('3'),
+            'G'..='I' => Some('4'),
+            'J'..='L' => Some('5'),
+            'M'..='O' => Some('6'),
+            'P'..='S' => Some('7'),
+            'T'..='V' => Some('8'),
+            'W'..='Z' => Some('9'),
+            _ => None,
+        })
+        .collect()
+}
+
 pub struct DtmfApp {
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
@@ -267,6 +287,10 @@ impl DtmfApp {
     fn rx_muted(&self) -> bool {
         self.rx_mute_until
             .map_or(false, |t| Instant::now() < t)
+    }
+
+    fn translate_dial(&mut self) {
+        self.dial_input = letters_to_digits(&self.dial_input);
     }
 
     fn start_dial(&mut self) {
@@ -522,10 +546,31 @@ impl eframe::App for DtmfApp {
                     ui.label(egui::RichText::new("DIAL STRING").color(AMBER_DIM).size(11.0));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.dial_input)
-                            .hint_text("18005551234")
+                            .hint_text("CA1-1234  or  18005551234")
                             .desired_width(f32::INFINITY)
                             .font(egui::TextStyle::Monospace),
                     );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_sized(
+                                [110.0, 24.0],
+                                egui::Button::new(
+                                    egui::RichText::new("NAME -> #").color(AMBER),
+                                )
+                                    .fill(CHARCOAL),
+                            )
+                            .on_hover_text("convert exchange letters to digits (CA1-1234 -> 221-1234)")
+                            .clicked()
+                        {
+                            self.translate_dial();
+                        }
+                        ui.label(
+                            egui::RichText::new("letters -> digits")
+                                .color(AMBER_DIM)
+                                .size(9.0),
+                        );
+                    });
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let dialing = !self.dial_queue.is_empty();
