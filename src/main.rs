@@ -20,11 +20,27 @@ fn main() -> eframe::Result<()> {
         audio::run_audio_engine(tx_ui, rx_cmd);
     });
 
+    // --- ICON LOADING ---
+    // include_bytes embeds the .ico file directly into the compiled binary
+    // The path is relative to the main.rs file.
+    let icon_data = include_bytes!("../assets/zdl-echo.ico");
+    let image = image::load_from_memory(icon_data)
+        .expect("Failed to load icon from memory")
+        .to_rgba8();
+    let (icon_width, icon_height) = image.dimensions();
+    let icon = egui::IconData {
+        rgba: image.into_raw(),
+        width: icon_width,
+        height: icon_height,
+    };
+    // --------------------
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([620.0, 720.0])
             .with_min_inner_size([540.0, 620.0])
-            .with_title("ZDL-ECHO"),
+            .with_title("ZDL-ECHO")
+            .with_icon(icon), // <-- Attach the icon to the window here
         ..Default::default()
     };
 
