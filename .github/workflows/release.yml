@@ -1,0 +1,68 @@
+name: Cross-Platform Release Build
+
+# This workflow triggers manually from the Actions tab, 
+# or automatically whenever you push a Git tag starting with "v" (e.g., v1.0.0)
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    
+    # This matrix tells GitHub to spin up three separate virtual machines simultaneously
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # LINUX SPECIFIC: Install the audio and display C-headers
+      - name: Install Linux Dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-x11-dev libwayland-dev libxkbcommon-dev
+
+      # WINDOWS & LINUX: Standard compilation
+      - name: Build Release Binary
+        if: matrix.os != 'macos-latest'
+        run: cargo build --release
+
+      # macOS SPECIFIC: Compile and package the .app bundle
+      - name: Build macOS App Bundle
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo install cargo-bundle
+          cargo bundle --release
+          # Zip the .app folder so it doesn't get corrupted when downloaded
+          cd target/release/bundle/osx
+          zip -r ../../../../ZDL-Echo-macOS.zip ZDL-Echo.app
+
+      # UPLOAD TO GITHUB RELEASES (Only happens if you triggered via a tag)
+      - name: Upload Windows Asset
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/ZDL-Echo.exe
+
+      - name: Upload Linux Asset
+        if: matrix.os == 'ubuntu-latest' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/ZDL-Echo
+
+      - name: Upload macOS Asset
+        if: matrix.os == 'macos-latest' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ZDL-Echo-macOS.zip

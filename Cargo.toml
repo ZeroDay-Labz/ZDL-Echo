@@ -17,7 +17,6 @@ debug = 0 # Skips generating the massive .pdb file on Windows
 [profile.dev.package."*"]
 opt-level = 3
 
-
 [profile.release]
 opt-level = 3          # Maximum CPU optimization for the DSP math
 lto = true             # Link Time Optimization (drastically reduces .exe size and boosts speed)
@@ -25,5 +24,19 @@ codegen-units = 1      # Forces the compiler to view the whole program at once t
 panic = "abort"        # Removes crash-unwinding code to save RAM and binary size
 strip = true           # Strips all debugging symbols from the final Windows binary
 
-[build-dependencies]
+# --- OS-SPECIFIC BUILD CONFIGURATIONS ---
+
+# 1. Windows: Only download winres when building for Windows
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1.12"
+
+# 2. macOS: Configuration for cargo-bundle
+[package.metadata.bundle]
+name = "ZDL-Echo"
+identifier = "com.zerodaylabs.zdlecho"
+icon = ["assets/zdl-echo.ico"]
+osx_minimum_system_version = "10.14"
+
+[package.metadata.bundle.osx.info_plist]
+# This is the mandatory security prompt macOS shows to the user
+NSMicrophoneUsageDescription = "ZDL-Echo requires audio input to capture and decode telecommunications signaling."
