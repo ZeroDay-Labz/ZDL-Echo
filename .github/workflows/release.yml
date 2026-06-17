@@ -1,19 +1,23 @@
 name: Cross-Platform Release Build
 
 # This workflow triggers manually from the Actions tab, 
-# or automatically whenever you push a Git tag starting with "v" (e.g., v1.0.0)
+# or automatically whenever a Git tag is pushed starting with "v" (e.g., v1.0.0)
 on:
   workflow_dispatch:
   push:
     tags:
       - 'v*'
 
+# ---> This should fix the 403 permission denied error
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     
-    # This matrix tells GitHub to spin up three separate virtual machines simultaneously
+    # This tells GitHub to spin up three separate virtual machines simultaneously
     strategy:
       fail-fast: false
       matrix:
