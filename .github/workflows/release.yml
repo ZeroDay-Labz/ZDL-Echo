@@ -72,18 +72,6 @@ jobs:
           cp target/debian/*.deb ZDL-Echo-amd64.deb
           cp target/generate-rpm/*.rpm ZDL-Echo-x86_64.rpm
 
-      # LINUX SPECIFIC: build a self-contained Flatpak bundle (network-isolated,
-      # vendored via packaging/flatpak/generated-sources.json — see
-      # packaging/flatpak/generate-sources.sh to regenerate it after a
-      # Cargo.lock change). Not published to Flathub; just attached below.
-      - name: Build Flatpak
-        if: matrix.os == 'ubuntu-latest'
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
-        with:
-          bundle: ZDL-Echo.flatpak
-          manifest-path: packaging/flatpak/com.zerodaylabs.zdlecho.yml
-          cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/**') }}
-
       # UPLOAD TO GITHUB RELEASES (Only happens if you triggered via a tag)
       - name: Upload Windows Asset
         if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
@@ -99,10 +87,40 @@ jobs:
             ZDL-Echo-amd64.deb
             ZDL-Echo-x86_64.rpm
             ZDL-Echo-linux-x86_64.tar.gz
-            ZDL-Echo.flatpak
 
       - name: Upload macOS Asset
         if: matrix.os == 'macos-latest' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ZDL-Echo-macOS.zip
+
+  # Separate job: flatpak-builder only exists in the flatpak-github-actions
+  # container images (bare ubuntu-latest doesn't have it), and the sandboxing
+  # it does under the hood needs `--privileged`. Builds a self-contained
+  # Flatpak bundle (network-isolated, vendored via
+  # packaging/flatpak/generated-sources.json — see
+  # packaging/flatpak/generate-sources.sh to regenerate it after a
+  # Cargo.lock change). Not published to Flathub; just attached to the release.
+  flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-23.08
+      options: --privileged
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: ZDL-Echo.flatpak
+          manifest-path: packaging/flatpak/com.zerodaylabs.zdlecho.yml
+          cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/**') }}
+
+      - name: Upload Flatpak Asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ZDL-Echo.flatpak
