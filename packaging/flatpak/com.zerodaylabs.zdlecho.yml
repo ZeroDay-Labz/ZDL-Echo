@@ -31,11 +31,12 @@ modules:
       - install -Dm755 target/release/ZDL-Echo /app/bin/zdl-echo
       - install -Dm644 packaging/linux/zdl-echo.desktop /app/share/applications/com.zerodaylabs.zdlecho.desktop
       - install -Dm644 packaging/linux/com.zerodaylabs.zdlecho.metainfo.xml /app/share/metainfo/com.zerodaylabs.zdlecho.metainfo.xml
-      - >-
-        for size in 16 32 48 64 128 256; do
-          install -Dm644 packaging/linux/icons/hicolor/${size}x${size}/apps/zdl-echo.png
-            /app/share/icons/hicolor/${size}x${size}/apps/zdl-echo.png;
-        done
+      - install -Dm644 packaging/linux/icons/hicolor/16x16/apps/zdl-echo.png /app/share/icons/hicolor/16x16/apps/zdl-echo.png
+      - install -Dm644 packaging/linux/icons/hicolor/32x32/apps/zdl-echo.png /app/share/icons/hicolor/32x32/apps/zdl-echo.png
+      - install -Dm644 packaging/linux/icons/hicolor/48x48/apps/zdl-echo.png /app/share/icons/hicolor/48x48/apps/zdl-echo.png
+      - install -Dm644 packaging/linux/icons/hicolor/64x64/apps/zdl-echo.png /app/share/icons/hicolor/64x64/apps/zdl-echo.png
+      - install -Dm644 packaging/linux/icons/hicolor/128x128/apps/zdl-echo.png /app/share/icons/hicolor/128x128/apps/zdl-echo.png
+      - install -Dm644 packaging/linux/icons/hicolor/256x256/apps/zdl-echo.png /app/share/icons/hicolor/256x256/apps/zdl-echo.png
     sources:
       - type: dir
         path: ../..
