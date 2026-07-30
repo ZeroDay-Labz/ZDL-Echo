@@ -16,6 +16,11 @@ pub enum AppMessage {
     // System & hardware commands
     SetInputDevice(String),
     SetOutputDevice(String),
+    /// Toggle 2600 Hz single-frequency RX detection at runtime.
+    SetDetectSf(bool),
     AudioStatus(String),
     AudioError(String),
+    /// Negotiated stream latency (ms), reported after a stream is (re)built so
+    /// the UI can size its self-echo RX mute window to the real audio path.
+    StreamLatency { output: bool, ms: f32 },
 }

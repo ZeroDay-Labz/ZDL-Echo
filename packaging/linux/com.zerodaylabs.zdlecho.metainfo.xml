@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.zerodaylabs.zdlecho</id>
+  <name>ZDL-Echo</name>
+  <summary>DTMF, MF (R1) and SF telecom signaling toolkit</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="com.zerodaylabs">
+    <name>Zero Day Labs</name>
+  </developer>
+
+  <description>
+    <p>
+      ZDL-Echo is a telecom research and signaling toolkit for generating and
+      decoding legacy tone signaling: DTMF (touch-tone dialing), R1 MF
+      (inter-office multi-frequency), and SF (2600 Hz single-frequency
+      supervisory tone). It includes a real-time oscilloscope view of the
+      captured audio and a Goertzel-based tone decoder tuned to reject false
+      positives from speech.
+    </p>
+    <p>
+      Intended for authorized diagnostics, telecom research, and education on
+      legacy switch/PBX signaling only.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">zdl-echo.desktop</launchable>
+  <icon type="local">zdl-echo.png</icon>
+
+  <categories>
+    <category>Network</category>
+    <category>Utility</category>
+    <category>Engineering</category>
+  </categories>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/ZDL-Echo/master/images/img.png</image>
+      <caption>Audio routing window</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/ZDL-Echo/master/images/img_1.png</image>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/ZeroDay-Labz/ZDL-Echo/master/images/img_2.png</image>
+      <caption>Main interface</caption>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/ZeroDay-Labz/ZDL-Echo</url>
+  <url type="bugtracker">https://github.com/ZeroDay-Labz/ZDL-Echo/issues</url>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="1.3.0" date="2026-07-30">
+      <description>
+        <p>Settings persistence, an SF (2600 Hz) RX detection toggle, TX/RX log export, audio engine hardening for lower-latency PipeWire playback, and Linux packaging (DEB/RPM/Flatpak/tar.gz).</p>
+      </description>
+    </release>
+  </releases>
+</component>

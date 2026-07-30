@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ZDL-Echo
+GenericName=Telecom Signaling Toolkit
+Comment=DTMF, MF (R1) and SF tone generator and decoder for authorized telecom research
+Exec=zdl-echo
+Icon=zdl-echo
+Terminal=false
+Categories=Network;Utility;Engineering;
+Keywords=DTMF;telecom;signaling;tone;phreaking;research;
+StartupWMClass=zdlecho

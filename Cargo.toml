@@ -1,8 +1,15 @@
 [package]
 name = "ZDL-Echo"
-version = "0.1.0"
+version = "1.3.0"
 edition = "2024"
 build = "build.rs"
+description = "DTMF, MF (R1) and SF telecom signaling toolkit — tone generator, decoder, and oscilloscope for authorized telecom research"
+license = "MIT"
+authors = ["Zero Day Labs"]
+repository = "https://github.com/ZeroDay-Labz/ZDL-Echo"
+homepage = "https://github.com/ZeroDay-Labz/ZDL-Echo"
+keywords = ["dtmf", "telecom", "signaling", "audio", "pipewire"]
+categories = ["multimedia::audio"]
 
 [dependencies]
 eframe = "0.34.3"
@@ -40,3 +47,50 @@ osx_minimum_system_version = "10.14"
 [package.metadata.bundle.osx.info_plist]
 # This is the mandatory security prompt macOS shows to the user
 NSMicrophoneUsageDescription = "ZDL-Echo requires audio input to capture and decode telecommunications signaling."
+
+# 3. Linux: DEB packaging via `cargo deb`
+[package.metadata.deb]
+maintainer = "Zero Day Labs"
+copyright = "2026, Zero Day Labs"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+ZDL-Echo generates and decodes legacy telecom tone signaling — DTMF, R1 MF \
+(inter-office), and SF (2600 Hz single-frequency supervisory) — with a \
+real-time oscilloscope view and a Goertzel-based decoder tuned to reject \
+speech false positives. For authorized diagnostics and telecom research only."""
+section = "utils"
+priority = "optional"
+depends = "$auto, libasound2, libx11-6, libxkbcommon0, libwayland-client0"
+assets = [
+    ["target/release/ZDL-Echo", "usr/bin/zdl-echo", "755"],
+    ["packaging/linux/zdl-echo.desktop", "usr/share/applications/com.zerodaylabs.zdlecho.desktop", "644"],
+    ["packaging/linux/com.zerodaylabs.zdlecho.metainfo.xml", "usr/share/metainfo/com.zerodaylabs.zdlecho.metainfo.xml", "644"],
+    ["packaging/linux/icons/hicolor/16x16/apps/zdl-echo.png", "usr/share/icons/hicolor/16x16/apps/zdl-echo.png", "644"],
+    ["packaging/linux/icons/hicolor/32x32/apps/zdl-echo.png", "usr/share/icons/hicolor/32x32/apps/zdl-echo.png", "644"],
+    ["packaging/linux/icons/hicolor/48x48/apps/zdl-echo.png", "usr/share/icons/hicolor/48x48/apps/zdl-echo.png", "644"],
+    ["packaging/linux/icons/hicolor/64x64/apps/zdl-echo.png", "usr/share/icons/hicolor/64x64/apps/zdl-echo.png", "644"],
+    ["packaging/linux/icons/hicolor/128x128/apps/zdl-echo.png", "usr/share/icons/hicolor/128x128/apps/zdl-echo.png", "644"],
+    ["packaging/linux/icons/hicolor/256x256/apps/zdl-echo.png", "usr/share/icons/hicolor/256x256/apps/zdl-echo.png", "644"],
+    ["README.md", "usr/share/doc/zdl-echo/README.md", "644"],
+]
+
+# 4. Linux: RPM packaging via `cargo generate-rpm`
+[package.metadata.generate-rpm]
+name = "zdl-echo"
+assets = [
+    { source = "target/release/ZDL-Echo", dest = "/usr/bin/zdl-echo", mode = "755" },
+    { source = "packaging/linux/zdl-echo.desktop", dest = "/usr/share/applications/com.zerodaylabs.zdlecho.desktop", mode = "644" },
+    { source = "packaging/linux/com.zerodaylabs.zdlecho.metainfo.xml", dest = "/usr/share/metainfo/com.zerodaylabs.zdlecho.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/16x16/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/16x16/apps/zdl-echo.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/32x32/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/32x32/apps/zdl-echo.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/48x48/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/48x48/apps/zdl-echo.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/64x64/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/64x64/apps/zdl-echo.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/128x128/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/128x128/apps/zdl-echo.png", mode = "644" },
+    { source = "packaging/linux/icons/hicolor/256x256/apps/zdl-echo.png", dest = "/usr/share/icons/hicolor/256x256/apps/zdl-echo.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/zdl-echo/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+alsa-lib = "*"
+libX11 = "*"
+libxkbcommon-x11 = "*"

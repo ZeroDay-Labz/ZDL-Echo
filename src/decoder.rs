@@ -7,6 +7,9 @@
 //! broadly, so every bin's coherence stays low. We only accept a detection when
 //! the candidate tones genuinely dominate the block.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 // ---- tunables ----
 const SQUELCH: f32 = 1e-5;     // mean-power floor; below this the block is "silence"
 const TONE_MIN: f32 = 0.06;    // each tone must hold >= 6% of block energy
@@ -14,10 +17,6 @@ const PAIR_MIN: f32 = 0.28;    // the two tones together must hold >= 28%
 const DOMINANCE: f32 = 1.8;    // winner must beat the runner-up in its group by this factor
 const MAX_TWIST_DB: f32 = 8.0; // allowed level difference between the two tones
 const SF_MIN: f32 = 0.45;      // 2600 must hold >= 45% (a pure tone is ~0.5)
-/// Detect the 2600 Hz single-frequency tone on RX. OFF by default — it is the
-/// biggest source of false hits on speech. Flip to `true` to re-enable it
-/// (with the strict SF_MIN gate above).
-const DETECT_SF: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToneType { Dtmf, Mf, Sf }
@@ -32,10 +31,14 @@ pub struct ToneDecoder {
     required_hits: u32,
     silence_count: u32,
     required_silence: u32,
+    /// Detect the 2600 Hz single-frequency tone on RX. OFF by default — it is
+    /// the biggest source of false hits on speech. Toggled live from the UI
+    /// (with the strict SF_MIN gate above still applying when enabled).
+    detect_sf: Arc<AtomicBool>,
 }
 
 impl ToneDecoder {
-    pub fn new(sample_rate: f32) -> Self {
+    pub fn new(sample_rate: f32, detect_sf: Arc<AtomicBool>) -> Self {
         Self {
             sample_rate,
             block_size: (sample_rate * 0.020) as usize, // 20 ms blocks
@@ -46,6 +49,7 @@ impl ToneDecoder {
             required_hits: 2, // confirm over ~40 ms so transient speech can't fake a tone
             silence_count: 0,
             required_silence: 1,
+            detect_sf,
         }
     }
 
@@ -120,18 +124,15 @@ impl ToneDecoder {
         let mc: Vec<f32> = mf.iter().map(|&f| coh(f)).collect();
         if let Some((i1, v1, i2, v2)) = top2(&mc) {
             let dom = v1 > TONE_MIN && v2 > TONE_MIN && v2 >= DOMINANCE * third(&mc, i1, i2);
-            if dom && v1 + v2 > PAIR_MIN && twist_ok(v1, v2) {
-                if let Some(ch) = decode_mf(mf[i1], mf[i2]) {
+            if dom && v1 + v2 > PAIR_MIN && twist_ok(v1, v2)
+                && let Some(ch) = decode_mf(mf[i1], mf[i2]) {
                     return Some((ToneType::Mf, ch));
                 }
-            }
         }
 
         // ---- SF: single 2600 Hz tone ----
-        if DETECT_SF {
-            if coh(2600.0) > SF_MIN {
-                return Some((ToneType::Sf, '⌁'));
-            }
+        if self.detect_sf.load(Ordering::Relaxed) && coh(2600.0) > SF_MIN {
+            return Some((ToneType::Sf, '⌁'));
         }
 
         None

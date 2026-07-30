@@ -1,8 +1,8 @@
 #![windows_subsystem = "windows"]
-#![allow(deprecated)]
 
 mod app;
 mod audio;
+mod config;
 mod decoder;
 mod generator;
 mod types;
@@ -40,7 +40,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([620.0, 720.0])
             .with_min_inner_size([540.0, 620.0])
             .with_title("ZDL-ECHO")
-            .with_icon(icon), // <-- Attach the icon to the window here
+            .with_app_id("zdlecho") // <-- Wayland application ID binding
+            .with_icon(icon),
         ..Default::default()
     };
 
@@ -50,3 +51,4 @@ fn main() -> eframe::Result<()> {
         Box::new(|_cc| Ok(Box::new(app::DtmfApp::new(tx_cmd, rx_ui)))),
     )
 }
+

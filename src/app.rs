@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use eframe::egui;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
@@ -26,9 +24,10 @@ const AMBER_SEL: egui::Color32 = egui::Color32::from_rgb(74, 52, 0); // selectio
 const DIAL_GAP_MS: u64 = 70;
 /// Silence (seconds) that ends a captured/transmitted run and starts a new line.
 const LINE_GAP_SECS: f32 = 3.0;
-/// After a tone is transmitted, keep ignoring RX for this long so the loopback
-/// of our own tone (which arrives late through the audio path) isn't decoded.
-const RX_MUTE_GRACE_MS: u64 = 250;
+/// Floor/ceiling clamp for the latency-derived RX mute grace below — keeps a
+/// pathological device-reported latency from muting forever or not at all.
+const RX_MUTE_GRACE_MIN_MS: f32 = 60.0;
+const RX_MUTE_GRACE_MAX_MS: f32 = 600.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
@@ -81,6 +80,13 @@ pub struct DtmfApp {
     next_fire_at: Option<Instant>,
     tx_until: Option<Instant>,
     rx_mute_until: Option<Instant>,
+    /// Negotiated device latency, reported by the audio thread once its
+    /// streams are up — used to size `rx_mute_until` to the real audio path
+    /// instead of a flat guess.
+    output_latency_ms: f32,
+    input_latency_ms: f32,
+
+    detect_sf: bool,
 
     current_f1: f32,
     current_f2: f32,
@@ -88,32 +94,32 @@ pub struct DtmfApp {
 
 impl DtmfApp {
     pub fn new(tx: Sender<AppMessage>, rx: Receiver<AppMessage>) -> Self {
-        let host = cpal::default_host();
-        let mut in_devs = Vec::new();
-        if let Ok(devices) = host.input_devices() {
-            for d in devices {
-                in_devs.push(d.to_string());
-            }
+        let (in_devs, default_in, out_devs, default_out) = Self::enumerate_devices();
+        let settings = crate::config::load();
+
+        // prefer the persisted device if it's still present on this system;
+        // otherwise fall back to whatever the host considers default
+        let selected_input = if in_devs.contains(&settings.input_device) {
+            settings.input_device.clone()
+        } else {
+            default_in
+        };
+        let selected_output = if out_devs.contains(&settings.output_device) {
+            settings.output_device.clone()
+        } else {
+            default_out
+        };
+        // the audio engine already opened its own host-default streams at
+        // startup; only re-route it if the restored selection differs
+        if !settings.input_device.is_empty() && selected_input == settings.input_device {
+            let _ = tx.send(AppMessage::SetInputDevice(selected_input.clone()));
         }
-        in_devs.dedup();
-
-        let default_in = host
-            .default_input_device()
-            .map(|d| d.to_string())
-            .unwrap_or_default();
-
-        let mut out_devs = Vec::new();
-        if let Ok(devices) = host.output_devices() {
-            for d in devices {
-                out_devs.push(d.to_string());
-            }
+        if !settings.output_device.is_empty() && selected_output == settings.output_device {
+            let _ = tx.send(AppMessage::SetOutputDevice(selected_output.clone()));
         }
-        out_devs.dedup();
-
-        let default_out = host
-            .default_output_device()
-            .map(|d| d.to_string())
-            .unwrap_or_default();
+        if settings.detect_sf {
+            let _ = tx.send(AppMessage::SetDetectSf(true));
+        }
 
         Self {
             tx,
@@ -123,14 +129,14 @@ impl DtmfApp {
             pend_rx: String::new(),
             pend_tx_at: None,
             pend_rx_at: None,
-            mode: Mode::Dtmf,
-            tone_ms: 120,
+            mode: if settings.mode_mf { Mode::Mf } else { Mode::Dtmf },
+            tone_ms: settings.tone_ms,
             show_about: false,
             show_routing: false,
             input_devices: in_devs,
-            selected_input: default_in,
+            selected_input,
             output_devices: out_devs,
-            selected_output: default_out,
+            selected_output,
             rx_level: 0.0,
             rx_wave: Vec::new(),
             dial_input: String::new(),
@@ -138,6 +144,9 @@ impl DtmfApp {
             next_fire_at: None,
             tx_until: None,
             rx_mute_until: None,
+            output_latency_ms: 20.0,
+            input_latency_ms: 20.0,
+            detect_sf: settings.detect_sf,
             current_f1: 0.0,
             current_f2: 0.0,
         }
@@ -177,7 +186,7 @@ impl DtmfApp {
         if !self.pend_tx.is_empty() {
             let idle = self
                 .pend_tx_at
-                .map_or(true, |t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
+                .is_none_or(|t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
             if force || idle {
                 self.committed.push_str(&format!("[TX] {}\n", self.pend_tx));
                 self.pend_tx.clear();
@@ -187,7 +196,7 @@ impl DtmfApp {
         if !self.pend_rx.is_empty() {
             let idle = self
                 .pend_rx_at
-                .map_or(true, |t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
+                .is_none_or(|t| now.duration_since(t).as_secs_f32() >= LINE_GAP_SECS);
             if force || idle {
                 self.committed.push_str(&format!("[RX] {}\n", self.pend_rx));
                 self.pend_rx.clear();
@@ -235,12 +244,20 @@ impl DtmfApp {
         self.pend_rx_at = None;
     }
 
+    /// RX self-echo mute window: covers the round trip through both the
+    /// output and input buffers (each direction can add up to its own
+    /// period before the data lands), plus a small margin.
+    fn rx_mute_grace_ms(&self) -> u64 {
+        ((self.output_latency_ms + self.input_latency_ms) * 2.0 + 40.0)
+            .clamp(RX_MUTE_GRACE_MIN_MS, RX_MUTE_GRACE_MAX_MS) as u64
+    }
+
     fn play(&mut self, f1: f32, f2: f32, label: &str) {
         let _ = self.tx.send(AppMessage::PlayTone { f1, f2, ms: self.tone_ms });
         self.tx_until = Some(Instant::now() + Duration::from_millis(self.tone_ms as u64));
         // ignore RX through the end of this tone plus a grace period
         self.rx_mute_until = Some(
-            Instant::now() + Duration::from_millis(self.tone_ms as u64 + RX_MUTE_GRACE_MS),
+            Instant::now() + Duration::from_millis(self.tone_ms as u64 + self.rx_mute_grace_ms()),
         );
         self.current_f1 = f1;
         self.current_f2 = f2;
@@ -278,15 +295,14 @@ impl DtmfApp {
         self.dial_queue.clear();
         self.next_fire_at = None;
         self.tx_until = None;
-        self.rx_mute_until = Some(Instant::now() + Duration::from_millis(RX_MUTE_GRACE_MS));
+        self.rx_mute_until = Some(Instant::now() + Duration::from_millis(self.rx_mute_grace_ms()));
         self.current_f1 = 0.0;
         self.current_f2 = 0.0;
         self.log_status("[SYS] transmit halted");
     }
 
     fn rx_muted(&self) -> bool {
-        self.rx_mute_until
-            .map_or(false, |t| Instant::now() < t)
+        self.rx_mute_until.is_some_and(|t| Instant::now() < t)
     }
 
     fn translate_dial(&mut self) {
@@ -313,7 +329,7 @@ impl DtmfApp {
             return;
         }
         let now = Instant::now();
-        let ready = self.next_fire_at.map_or(true, |t| now >= t);
+        let ready = self.next_fire_at.is_none_or(|t| now >= t);
         if !ready {
             return;
         }
@@ -328,7 +344,58 @@ impl DtmfApp {
     }
 
     fn tx_active(&self) -> bool {
-        self.tx_until.map_or(false, |t| Instant::now() < t)
+        self.tx_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// (input names, default input, output names, default output) from the
+    /// host's current device list. Cheap enough to call on demand (device
+    /// open, not per frame) so the routing window can pick up hot-plugged
+    /// devices without an app restart.
+    fn enumerate_devices() -> (Vec<String>, String, Vec<String>, String) {
+        let host = cpal::default_host();
+
+        let mut in_devs = Vec::new();
+        if let Ok(devices) = host.input_devices() {
+            for d in devices {
+                in_devs.push(d.to_string());
+            }
+        }
+        in_devs.dedup();
+        let default_in = host
+            .default_input_device()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+
+        let mut out_devs = Vec::new();
+        if let Ok(devices) = host.output_devices() {
+            for d in devices {
+                out_devs.push(d.to_string());
+            }
+        }
+        out_devs.dedup();
+        let default_out = host
+            .default_output_device()
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+
+        (in_devs, default_in, out_devs, default_out)
+    }
+
+    /// Re-list available devices without touching the current selection.
+    fn refresh_devices(&mut self) {
+        let (in_devs, _, out_devs, _) = Self::enumerate_devices();
+        self.input_devices = in_devs;
+        self.output_devices = out_devs;
+    }
+
+    fn save_settings(&self) {
+        crate::config::save(&crate::config::Settings {
+            input_device: self.selected_input.clone(),
+            output_device: self.selected_output.clone(),
+            mode_mf: matches!(self.mode, Mode::Mf),
+            tone_ms: self.tone_ms,
+            detect_sf: self.detect_sf,
+        });
     }
 
     /// Horizontal input-level bar. Green (quiet) -> amber -> red (hot).
@@ -353,7 +420,7 @@ impl DtmfApp {
             let fill = egui::Rect::from_min_size(r.min, egui::vec2(fill_w, r.height()));
             painter.rect_filled(fill, 0.0, col);
         }
-        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Inside);
     }
 
     fn apply_style(&self, ctx: &egui::Context) {
@@ -369,12 +436,12 @@ impl DtmfApp {
         // selection in dark amber so highlighted text / items stay readable
         // (was solid green-on-green = invisible).
         v.selection.bg_fill = AMBER_SEL;
-        v.selection.stroke = egui::Stroke::new(1.0, AMBER);
+        v.selection.stroke = egui::Stroke::new(1.0_f32, AMBER);
 
         v.widgets.hovered.bg_fill = CHARCOAL;
-        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, AMBER);
+        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, AMBER);
         v.widgets.active.bg_fill = AMBER;
-        v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::BLACK);
+        v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::BLACK);
 
         ctx.set_visuals(v);
 
@@ -389,7 +456,7 @@ impl eframe::App for DtmfApp {
         let ctx = ui.ctx().clone();
         self.apply_style(&ctx);
 
-        let typing = ctx.wants_keyboard_input();
+        let typing = ctx.egui_wants_keyboard_input();
         let mut keys: Vec<char> = Vec::new();
         let mut kill = false;
         ctx.input_mut(|i| {
@@ -442,6 +509,13 @@ impl eframe::App for DtmfApp {
                 AppMessage::AudioError(e) => {
                     self.log_status(&format!("[ERR] {e}"));
                 }
+                AppMessage::StreamLatency { output, ms } => {
+                    if output {
+                        self.output_latency_ms = ms;
+                    } else {
+                        self.input_latency_ms = ms;
+                    }
+                }
                 _ => {}
             }
         }
@@ -450,17 +524,17 @@ impl eframe::App for DtmfApp {
         // commit any run that's gone quiet for >= LINE_GAP_SECS
         self.flush_pending(false);
 
-        let control_frame = egui::Frame::none()
+        let control_frame = egui::Frame::NONE
             .fill(PANEL)
-            .stroke(egui::Stroke::new(1.0, BORDER))
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
             .inner_margin(12.0);
-        let terminal_frame = egui::Frame::none()
+        let terminal_frame = egui::Frame::NONE
             .fill(TERM_BG)
-            .stroke(egui::Stroke::new(1.0, DIM))
+            .stroke(egui::Stroke::new(1.0_f32, DIM))
             .inner_margin(14.0);
 
         // ---- top bar ----
-        egui::TopBottomPanel::top("menu").show_inside(ui, |ui| {
+        egui::Panel::top("menu").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("SYSTEM", |ui| {
                     if ui.button("about").clicked() {
@@ -475,6 +549,7 @@ impl eframe::App for DtmfApp {
 
                 ui.menu_button("ROUTING", |ui| {
                     if ui.button("Capture Source / Endpoints").clicked() {
+                        self.refresh_devices();
                         self.show_routing = true;
                         ui.close();
                     }
@@ -487,8 +562,8 @@ impl eframe::App for DtmfApp {
         });
 
         // ---- control deck ----
-        egui::SidePanel::left("controls")
-            .exact_width(244.0)
+        egui::Panel::left("controls")
+            .exact_size(244.0)
             .frame(control_frame)
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -534,13 +609,16 @@ impl eframe::App for DtmfApp {
                                 .clicked()
                             {
                                 self.mode = m;
+                                self.save_settings();
                             }
                         }
                     });
 
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("DURATION").color(AMBER_DIM).size(11.0));
-                    ui.add(egui::Slider::new(&mut self.tone_ms, 40..=600).suffix(" ms"));
+                    if ui.add(egui::Slider::new(&mut self.tone_ms, 40..=600).suffix(" ms")).changed() {
+                        self.save_settings();
+                    }
 
                     ui.add_space(12.0);
                     ui.label(egui::RichText::new("DIAL STRING").color(AMBER_DIM).size(11.0));
@@ -615,6 +693,15 @@ impl eframe::App for DtmfApp {
                         .clicked()
                     {
                         self.fire_sf();
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(&mut self.detect_sf, egui::RichText::new("detect 2600 Hz on RX").color(AMBER_DIM).size(10.0))
+                        .on_hover_text("also strict-gate 2600 Hz on receive, not just transmit — off by default, it's the biggest source of false hits on speech")
+                        .changed()
+                    {
+                        let _ = self.tx.send(AppMessage::SetDetectSf(self.detect_sf));
+                        self.save_settings();
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -696,7 +783,7 @@ impl eframe::App for DtmfApp {
                 painter.rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(1.0, BORDER),
+                    egui::Stroke::new(1.0_f32, BORDER),
                     egui::StrokeKind::Inside,
                 );
                 painter.line_segment(
@@ -704,7 +791,7 @@ impl eframe::App for DtmfApp {
                         egui::pos2(rect.left(), rect.center().y),
                         egui::pos2(rect.right(), rect.center().y),
                     ],
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 40, 20)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(20, 40, 20)),
                 );
 
                 // ---- real RX waveform, auto-scaled so quiet tones still show ----
@@ -726,7 +813,7 @@ impl eframe::App for DtmfApp {
                             egui::pos2(x, y)
                         })
                         .collect();
-                    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, GREEN)));
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, GREEN)));
                     painter.text(
                         rect.left_top() + egui::vec2(8.0, 8.0),
                         egui::Align2::LEFT_TOP,
@@ -740,7 +827,7 @@ impl eframe::App for DtmfApp {
                             egui::pos2(rect.left(), rect.center().y),
                             egui::pos2(rect.right(), rect.center().y),
                         ],
-                        egui::Stroke::new(2.0, DIM),
+                        egui::Stroke::new(2.0_f32, DIM),
                     );
                     painter.text(
                         rect.left_top() + egui::vec2(8.0, 8.0),
@@ -775,6 +862,12 @@ impl eframe::App for DtmfApp {
                         if ui.button("clear").clicked() {
                             self.clear_log();
                         }
+                        if ui.button("save log").clicked() {
+                            match crate::config::export_log(&self.display_log()) {
+                                Ok(path) => self.log_status(&format!("[SYS] log saved -> {}", path.display())),
+                                Err(e) => self.log_status(&format!("[ERR] log save failed: {e}")),
+                            }
+                        }
                     });
                 });
                 ui.separator();
@@ -805,7 +898,7 @@ impl eframe::App for DtmfApp {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut keep_open)
-                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(15, 15, 15)))
+                .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_rgb(15, 15, 15)))
                 .show(&ctx, |ui| {
                     ui.set_max_width(380.0);
 
@@ -841,6 +934,7 @@ impl eframe::App for DtmfApp {
                     if let Some(d) = out_clicked {
                         self.selected_output = d.clone();
                         let _ = self.tx.send(AppMessage::SetOutputDevice(d));
+                        self.save_settings();
                     }
 
                     ui.add_space(8.0);
@@ -888,6 +982,7 @@ impl eframe::App for DtmfApp {
                     if let Some(d) = clicked {
                         self.selected_input = d.clone();
                         let _ = self.tx.send(AppMessage::SetInputDevice(d));
+                        self.save_settings();
                     }
 
                     ui.add_space(8.0);
@@ -917,7 +1012,7 @@ impl eframe::App for DtmfApp {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.show_about)
-                .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_rgb(15, 15, 15)))
+                .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_rgb(15, 15, 15)))
                 .show(&ctx, |ui| {
                     ui.set_max_width(360.0);
                     ui.heading(egui::RichText::new("PROJECT: ZDL-ECHO").color(AMBER));
