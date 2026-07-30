@@ -17,6 +17,11 @@ finish-args:
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    # matches the "dest": "cargo" path generated-sources.json writes its
+    # vendored-source config to (cargo/config, not the default .cargo/) —
+    # without this cargo never finds the offline source replacement
+    CARGO_HOME: /run/build/zdl-echo/cargo
 
 modules:
   - name: zdl-echo
