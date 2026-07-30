@@ -94,9 +94,11 @@ jobs:
         with:
           files: ZDL-Echo-macOS.zip
 
-  # Separate job: flatpak-builder only exists in the flatpak-github-actions
-  # container images (bare ubuntu-latest doesn't have it), and the sandboxing
-  # it does under the hood needs `--privileged`. Builds a self-contained
+  # Separate job so a Flatpak failure never blocks the exe/zip/deb/rpm/tar.gz
+  # uploads above. Installs flatpak-builder and the runtime/SDK/rust-stable
+  # extension fresh from Flathub (rather than the pre-baked
+  # flatpak-github-actions container images, which are frozen as of the image
+  # build date and can lag behind egui's MSRV). Builds a self-contained
   # Flatpak bundle (network-isolated, vendored via
   # packaging/flatpak/generated-sources.json — see
   # packaging/flatpak/generate-sources.sh to regenerate it after a
@@ -104,13 +106,20 @@ jobs:
   flatpak:
     name: Build Flatpak
     runs-on: ubuntu-latest
-    container:
-      image: bilelmoussaoui/flatpak-github-actions:freedesktop-24.08
-      options: --privileged
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install Flatpak tooling and runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder xvfb
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install --system -y flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//24.08
 
       - name: Build Flatpak
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
