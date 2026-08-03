@@ -5,6 +5,8 @@ mod audio;
 mod config;
 mod decoder;
 mod generator;
+#[cfg(target_os = "linux")]
+mod pw_route;
 mod types;
 
 use crossbeam_channel::unbounded;
@@ -16,9 +18,24 @@ fn main() -> eframe::Result<()> {
     // audio engine -> UI (errors / status)
     let (tx_ui, rx_ui) = unbounded::<AppMessage>();
 
+    let tx_ui_audio = tx_ui.clone();
     std::thread::spawn(move || {
-        audio::run_audio_engine(tx_ui, rx_cmd);
+        audio::run_audio_engine(tx_ui_audio, rx_cmd);
     });
+
+    // Software (PipeWire application) routing — Linux only. UI -> pw thread
+    // commands travel over pipewire's own channel type since pw objects
+    // can't cross threads; pw thread -> UI reuses the crossbeam channel above.
+    #[cfg(target_os = "linux")]
+    let pw_cmd_tx: types::PwSender = {
+        let (pw_cmd_tx, pw_cmd_rx) = pipewire::channel::channel::<types::PwCommand>();
+        std::thread::spawn(move || {
+            pw_route::run(tx_ui, pw_cmd_rx);
+        });
+        pw_cmd_tx
+    };
+    #[cfg(not(target_os = "linux"))]
+    let pw_cmd_tx: types::PwSender = types::PwSender;
 
     // --- ICON LOADING ---
     // include_bytes embeds the .ico file directly into the compiled binary
@@ -48,7 +65,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ZDL-ECHO",
         options,
-        Box::new(|_cc| Ok(Box::new(app::DtmfApp::new(tx_cmd, rx_ui)))),
+        Box::new(|_cc| Ok(Box::new(app::DtmfApp::new(tx_cmd, rx_ui, pw_cmd_tx)))),
     )
 }
 

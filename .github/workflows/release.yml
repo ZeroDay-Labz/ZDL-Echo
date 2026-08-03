@@ -30,12 +30,13 @@ jobs:
       - name: Set up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # LINUX SPECIFIC: Install the audio and display C-headers
+      # LINUX SPECIFIC: Install the audio and display C-headers, plus
+      # PipeWire dev headers + clang (bindgen) for the software-routing engine
       - name: Install Linux Dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-x11-dev libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-x11-dev libwayland-dev libxkbcommon-dev libpipewire-0.3-dev clang
 
       # WINDOWS & LINUX: Standard compilation
       - name: Build Release Binary

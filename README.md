@@ -28,6 +28,7 @@
   * **SF:** Single-frequency trunk supervision (2600 Hz TX). RX detection is off by default to avoid voice-falsing — toggle **"detect 2600 Hz on RX"** in the SUPERVISORY panel to enable it; the setting is remembered between runs.
 * **Real-Time Visualization:** Native oscilloscope rendering with auto-scaling for live signal analysis.
 * **Dynamic Audio Routing:** Cross-platform hardware endpoint scanning (WASAPI on Windows, CoreAudio on macOS, ALSA/PipeWire on Linux) with hot-swapping and on-demand device list refresh.
+* **Software Routing (Linux/PipeWire):** The ROUTING menu also lists other applications' live audio streams (a browser tab, Discord, a SIP softphone, ...) directly — pick one to inject generated tones straight into its mic/input stream, or to decode straight from its speaker/playback stream, with no external patchbay. Links are additive on top of whatever hardware device is selected above and clean up automatically if ZDL-Echo or the target app closes.
 * **Sequence Dialing:** Built-in dial string processor with automated millisecond timing gaps for reliable sequence transmission.
 * **Settings Persistence:** Last-used input/output device, mode, tone duration, and the SF RX toggle are restored on the next launch.
 * **Log Export:** Save the TX/RX log to a timestamped text file from the log panel.
@@ -39,7 +40,7 @@
 * **OS:** Windows 10/11, Linux, or macOS 10.14+
 * **Audio Infrastructure:**
   * **Windows:** **[Voicemeeter](https://vb-audio.com/Voicemeeter/)** is recommended for routing a specific application's audio into the ZDL-Echo RX capture stream.
-  * **Linux (PipeWire/WirePlumber):** No extra software is required to route real hardware devices — pick them directly in the **ROUTING** menu. To capture a specific application's output instead, use a patchbay such as [`qpwgraph`](https://github.com/rncbc/qpwgraph) or [`helvum`](https://gitlab.freedesktop.org/pipewire/helvum) (or `pw-link` on the command line) to connect that application's output to ZDL-Echo's input, the same role Voicemeeter plays on Windows.
+  * **Linux (PipeWire/WirePlumber):** No extra software is required — pick hardware devices directly in the **ROUTING** menu, or pick a running application under **SOFTWARE** to link straight into/out of it. A patchbay such as [`qpwgraph`](https://github.com/rncbc/qpwgraph) or [`helvum`](https://gitlab.freedesktop.org/pipewire/helvum) (or `pw-link` on the command line) is only needed for routing scenarios the built-in picker doesn't cover.
 * **Compiler (building from source):** Rust 1.85+ (Edition 2024)
 
 ---
@@ -81,9 +82,10 @@ To analyze signals from specific applications:
 2. **Hook the Stream:** Launch ZDL-Echo, navigate to the **ROUTING** menu in the top bar, and select the corresponding *Voicemeeter Output* as your **RX CAPTURE SOURCE**.
 
 **Linux (PipeWire/WirePlumber):**
-1. Launch ZDL-Echo, then open a patchbay (`qpwgraph`/`helvum`) or run `pw-link`.
-2. Connect your target application's output ports to ZDL-Echo's input ports (ZDL-Echo appears under the input device you selected in the **ROUTING** menu).
-3. If you add or remove audio devices while ZDL-Echo is running, reopen the **ROUTING** window to refresh the device list.
+1. Launch ZDL-Echo and open the **ROUTING** menu.
+2. Under **SOFTWARE**, click **TX ->** next to an app to inject tones into its mic/input stream (e.g. dial into a call through Discord or a SIP softphone), or **<- RX** to decode its speaker/playback stream. Apps only appear once they actually have an active audio stream open (e.g. mid-call).
+3. For anything the picker doesn't cover, fall back to a patchbay (`qpwgraph`/`helvum`) or `pw-link` as before.
+4. If you add or remove hardware audio devices while ZDL-Echo is running, reopen the **ROUTING** window to refresh the device list.
 
 **All platforms:** The `SIGNAL OSCILLOSCOPE` provides real-time waveform visualization, and the `TX/RX LOG` spools captured signaling data (savable via the **save log** button).
 
@@ -98,8 +100,10 @@ This project uses `cpal` for low-latency audio hardware access and `egui` for GP
 git clone https://github.com/ZeroDay-Labz/ZDL-Echo.git
 cd ZDL-Echo
 
-# Linux only: audio + windowing headers
-sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-x11-dev libwayland-dev libxkbcommon-dev
+# Linux only: audio + windowing headers, plus PipeWire dev headers and
+# clang (bindgen) for the software-routing engine
+sudo apt-get install -y libasound2-dev libx11-dev libxkbcommon-x11-dev libwayland-dev libxkbcommon-dev libpipewire-0.3-dev clang
+# Fedora equivalent: sudo dnf install alsa-lib-devel libX11-devel libxkbcommon-x11-devel pipewire-devel clang
 
 # Compile for production
 cargo build --release

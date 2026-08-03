@@ -3,7 +3,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use cpal::traits::HostTrait;
-use crate::types::AppMessage;
+use crate::types::{AppMessage, PwCommand, PwSender, SoftwareApp};
 use crate::generator::{get_dtmf_freqs, get_mf_freqs};
 
 // ---- phosphor palette ----
@@ -58,6 +58,8 @@ fn letters_to_digits(s: &str) -> String {
 pub struct DtmfApp {
     tx: Sender<AppMessage>,
     rx: Receiver<AppMessage>,
+    pw_tx: PwSender,
+    sw_apps: Vec<SoftwareApp>,
     committed: String,        // finished lines (history)
     pend_tx: String,          // current TX run, not yet committed
     pend_rx: String,          // current RX run, not yet committed
@@ -93,7 +95,7 @@ pub struct DtmfApp {
 }
 
 impl DtmfApp {
-    pub fn new(tx: Sender<AppMessage>, rx: Receiver<AppMessage>) -> Self {
+    pub fn new(tx: Sender<AppMessage>, rx: Receiver<AppMessage>, pw_tx: PwSender) -> Self {
         let (in_devs, default_in, out_devs, default_out) = Self::enumerate_devices();
         let settings = crate::config::load();
 
@@ -124,6 +126,8 @@ impl DtmfApp {
         Self {
             tx,
             rx,
+            pw_tx,
+            sw_apps: Vec::new(),
             committed: String::from("ZDL-ECHO // TONE TRANSMITTER\nready.\n"),
             pend_tx: String::new(),
             pend_rx: String::new(),
@@ -515,6 +519,9 @@ impl eframe::App for DtmfApp {
                     } else {
                         self.input_latency_ms = ms;
                     }
+                }
+                AppMessage::SoftwareApps(apps) => {
+                    self.sw_apps = apps;
                 }
                 _ => {}
             }
@@ -987,14 +994,92 @@ impl eframe::App for DtmfApp {
 
                     ui.add_space(8.0);
                     ui.separator();
+
+                    // ---- SOFTWARE (PipeWire application) routing ----
+                    ui.label(egui::RichText::new("SOFTWARE (applications)").color(AMBER).strong());
+                    if self.sw_apps.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "no application audio streams detected yet — open a call \
+                                 (browser tab, Discord, your softphone) and it'll show up here",
+                            )
+                                .color(AMBER_DIM)
+                                .size(10.0),
+                        );
+                    } else {
+                        ui.push_id("sw_app_list", |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    egui::Grid::new("sw_apps_grid")
+                                        .num_columns(3)
+                                        .spacing([8.0, 6.0])
+                                        .show(ui, |ui| {
+                                            for app in &self.sw_apps {
+                                                ui.label(egui::RichText::new(&app.label).color(WHITE));
+
+                                                let tx_label = if app.linked_tx { "TX \u{25CF}" } else { "TX ->" };
+                                                let (tx_col, tx_fill) = if app.linked_tx {
+                                                    (egui::Color32::BLACK, AMBER)
+                                                } else {
+                                                    (DIM, CHARCOAL)
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        app.can_tx,
+                                                        egui::Button::new(egui::RichText::new(tx_label).color(tx_col))
+                                                            .fill(tx_fill),
+                                                    )
+                                                    .on_hover_text("inject generated tones into this app's mic/input stream")
+                                                    .clicked()
+                                                {
+                                                    let cmd = if app.linked_tx {
+                                                        PwCommand::UnlinkTx(app.label.clone())
+                                                    } else {
+                                                        PwCommand::LinkTx(app.label.clone())
+                                                    };
+                                                    let _ = self.pw_tx.send(cmd);
+                                                }
+
+                                                let rx_label = if app.linked_rx { "RX \u{25CF}" } else { "<- RX" };
+                                                let (rx_col, rx_fill) = if app.linked_rx {
+                                                    (egui::Color32::BLACK, AMBER)
+                                                } else {
+                                                    (DIM, CHARCOAL)
+                                                };
+                                                if ui
+                                                    .add_enabled(
+                                                        app.can_rx,
+                                                        egui::Button::new(egui::RichText::new(rx_label).color(rx_col))
+                                                            .fill(rx_fill),
+                                                    )
+                                                    .on_hover_text("decode this app's playback/speaker stream")
+                                                    .clicked()
+                                                {
+                                                    let cmd = if app.linked_rx {
+                                                        PwCommand::UnlinkRx(app.label.clone())
+                                                    } else {
+                                                        PwCommand::LinkRx(app.label.clone())
+                                                    };
+                                                    let _ = self.pw_tx.send(cmd);
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        });
+                    }
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            "To capture a specific app, route it to a Voicemeeter virtual \
-                             input in Voicemeeter, then pick that bus (e.g. \"Voicemeeter Out B1\") \
-                             above. ZDL-Echo captures the device; Voicemeeter does the per-app routing.",
+                            "software links are additive on top of the hardware endpoints above \
+                             (Linux/PipeWire only). On Windows, route a specific app through \
+                             Voicemeeter and pick that virtual bus above instead.",
                         )
-                            .color(AMBER_DIM),
+                            .color(AMBER_DIM)
+                            .size(9.0),
                     );
+
                     ui.add_space(6.0);
                     if ui.button("[ CLOSE ]").clicked() {
                         close_routing = true;
