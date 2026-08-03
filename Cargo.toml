@@ -1,6 +1,6 @@
 [package]
 name = "ZDL-Echo"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 build = "build.rs"
 description = "DTMF, MF (R1) and SF telecom signaling toolkit — tone generator, decoder, and oscilloscope for authorized telecom research"

@@ -4,6 +4,9 @@ runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  # bindgen (pipewire-sys, for software audio routing) needs libclang, which
+  # isn't part of the base SDK — pull it in as its own extension.
+  - org.freedesktop.Sdk.Extension.llvm20
 command: zdl-echo
 
 # audio via PipeWire's pulseaudio-compatible socket; wayland with an X11
@@ -16,12 +19,14 @@ finish-args:
   - --share=ipc
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
   env:
     # matches the "dest": "cargo" path generated-sources.json writes its
     # vendored-source config to (cargo/config, not the default .cargo/) —
     # without this cargo never finds the offline source replacement
     CARGO_HOME: /run/build/zdl-echo/cargo
+    # bindgen's libclang-sys looks here for libclang.so.*
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
 
 modules:
   - name: zdl-echo
